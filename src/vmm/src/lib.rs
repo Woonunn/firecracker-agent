@@ -330,6 +330,10 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    // Tracks whether the VM is currently in LLM wait mode.
+    in_llm_wait: bool,
+    // Stores balloon size before entering LLM wait mode.
+    prev_balloon_mib: Option<u32>,
 }
 
 impl Vmm {
@@ -549,11 +553,28 @@ impl Vmm {
 
     /// Transitions the microVM into an LLM wait mode.
     pub fn enter_llm_wait(&mut self, _config: EnterLlmWaitConfig) -> Result<(), VmmError> {
+        if self.in_llm_wait {
+            info!("Ignoring duplicate EnterLlmWait request.");
+            return Ok(());
+        }
+
+        self.in_llm_wait = true;
+        self.prev_balloon_mib = None;
+        info!("MicroVM entered LLM wait mode.");
         Ok(())
     }
 
     /// Transitions the microVM out of an LLM wait mode.
     pub fn exit_llm_wait(&mut self) -> Result<(), VmmError> {
+        if !self.in_llm_wait {
+            self.prev_balloon_mib = None;
+            info!("Ignoring duplicate ExitLlmWait request.");
+            return Ok(());
+        }
+
+        self.in_llm_wait = false;
+        self.prev_balloon_mib = None;
+        info!("MicroVM exited LLM wait mode.");
         Ok(())
     }
 
@@ -894,5 +915,58 @@ impl MutEventSubscriber for Vmm {
         if let Err(err) = ops.add(Events::new(&self.vcpus_exit_evt, EventSet::IN)) {
             error!("Failed to register vmm exit event: {}", err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::tests::default_vmm;
+
+    #[test]
+    fn test_enter_llm_wait_is_idempotent() {
+        let mut vmm = default_vmm();
+        let config = EnterLlmWaitConfig {
+            target_balloon_mib: Some(256),
+            acknowledge_on_stop: Some(true),
+        };
+
+        assert!(!vmm.in_llm_wait);
+        assert_eq!(vmm.prev_balloon_mib, None);
+
+        vmm.enter_llm_wait(config.clone()).unwrap();
+        assert!(vmm.in_llm_wait);
+        assert_eq!(vmm.prev_balloon_mib, None);
+
+        vmm.enter_llm_wait(config).unwrap();
+        assert!(vmm.in_llm_wait);
+        assert_eq!(vmm.prev_balloon_mib, None);
+    }
+
+    #[test]
+    fn test_exit_llm_wait_is_idempotent() {
+        let mut vmm = default_vmm();
+        let config = EnterLlmWaitConfig {
+            target_balloon_mib: None,
+            acknowledge_on_stop: None,
+        };
+
+        vmm.prev_balloon_mib = Some(128);
+        vmm.exit_llm_wait().unwrap();
+        assert!(!vmm.in_llm_wait);
+        assert_eq!(vmm.prev_balloon_mib, None);
+
+        vmm.enter_llm_wait(config).unwrap();
+        assert!(vmm.in_llm_wait);
+
+        vmm.prev_balloon_mib = Some(256);
+        vmm.exit_llm_wait().unwrap();
+        assert!(!vmm.in_llm_wait);
+        assert_eq!(vmm.prev_balloon_mib, None);
+
+        vmm.prev_balloon_mib = Some(64);
+        vmm.exit_llm_wait().unwrap();
+        assert!(!vmm.in_llm_wait);
+        assert_eq!(vmm.prev_balloon_mib, None);
     }
 }
