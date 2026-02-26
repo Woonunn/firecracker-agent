@@ -756,9 +756,20 @@ impl RuntimeApiController {
                 value,
             ),
             Resume => self.resume(),
-            EnterLlmWait(_) | ExitLlmWait => Err(VmmActionError::NotSupported(
-                "agent runtime control is not implemented".to_string(),
-            )),
+            EnterLlmWait(config) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .enter_llm_wait(config)
+                .map(|_| VmmData::Empty)
+                .map_err(VmmActionError::InternalVmm),
+            ExitLlmWait => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .exit_llm_wait()
+                .map(|_| VmmData::Empty)
+                .map_err(VmmActionError::InternalVmm),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => self.send_ctrl_alt_del(),
             UpdateBalloon(balloon_update) => self
@@ -1319,14 +1330,14 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_not_supported() {
+    fn test_runtime_agent_runtime_noop() {
         let res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
             target_balloon_mib: Some(256),
             acknowledge_on_stop: Some(true),
         }));
-        assert!(matches!(res, Err(VmmActionError::NotSupported(_))), "{:?}", res);
+        assert_eq!(res.unwrap(), VmmData::Empty);
 
         let res = runtime_request(VmmAction::ExitLlmWait);
-        assert!(matches!(res, Err(VmmActionError::NotSupported(_))), "{:?}", res);
+        assert_eq!(res.unwrap(), VmmData::Empty);
     }
 }

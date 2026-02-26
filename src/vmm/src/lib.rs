@@ -161,6 +161,7 @@ use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
+use crate::vmm_config::agent_runtime::EnterLlmWaitConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::vstate::vcpu::VcpuState;
@@ -543,6 +544,16 @@ impl Vmm {
         }
 
         self.instance_info.state = VmState::Paused;
+        Ok(())
+    }
+
+    /// Transitions the microVM into an LLM wait mode.
+    pub fn enter_llm_wait(&mut self, _config: EnterLlmWaitConfig) -> Result<(), VmmError> {
+        Ok(())
+    }
+
+    /// Transitions the microVM out of an LLM wait mode.
+    pub fn exit_llm_wait(&mut self) -> Result<(), VmmError> {
         Ok(())
     }
 
