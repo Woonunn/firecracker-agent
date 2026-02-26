@@ -26,7 +26,7 @@ mod tests {
     use crate::api_server::parsed_request::tests::vmm_action_from_request;
 
     #[test]
-    fn test_parse_patch_agent_runtime_request() {
+    fn test_parse_patch_agent_runtime_enter_llm_wait() {
         let body = r#"{
             "state": "LlmWaiting",
             "target_balloon_mib": 512,
@@ -39,7 +39,24 @@ mod tests {
                 acknowledge_on_stop: Some(true),
             })
         );
+    }
 
+    #[test]
+    fn test_parse_patch_agent_runtime_enter_llm_wait_defaults() {
+        let body = r#"{
+            "state": "LlmWaiting"
+        }"#;
+        assert_eq!(
+            vmm_action_from_request(parse_patch_agent_runtime(&Body::new(body)).unwrap()),
+            VmmAction::EnterLlmWait(EnterLlmWaitConfig {
+                target_balloon_mib: None,
+                acknowledge_on_stop: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_patch_agent_runtime_exit_llm_wait() {
         let body = r#"{
             "state": "Running"
         }"#;
@@ -47,8 +64,38 @@ mod tests {
             vmm_action_from_request(parse_patch_agent_runtime(&Body::new(body)).unwrap()),
             VmmAction::ExitLlmWait
         );
+    }
 
-        parse_patch_agent_runtime(&Body::new("invalid_payload")).unwrap_err();
+    #[test]
+    fn test_parse_patch_agent_runtime_bad_request_body() {
+        assert!(matches!(
+            parse_patch_agent_runtime(&Body::new("invalid_payload")),
+            Err(RequestError::SerdeJson(_))
+        ));
+
+        let body = r#"{
+            "target_balloon_mib": 512
+        }"#;
+        assert!(matches!(
+            parse_patch_agent_runtime(&Body::new(body)),
+            Err(RequestError::SerdeJson(_))
+        ));
+
+        let body = r#"{
+            "state": "Paused"
+        }"#;
+        assert!(matches!(
+            parse_patch_agent_runtime(&Body::new(body)),
+            Err(RequestError::SerdeJson(_))
+        ));
+
+        let body = r#"{
+            "state": "Running",
+            "unexpected": true
+        }"#;
+        assert!(matches!(
+            parse_patch_agent_runtime(&Body::new(body)),
+            Err(RequestError::SerdeJson(_))
+        ));
     }
 }
-
