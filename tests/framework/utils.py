@@ -376,10 +376,20 @@ def run_guest_cmd(ssh_connection, cmd, expected, use_json=False):
 
 
 def dump_proc_state(pid):
-    """Log diagnostic info for a process that failed to exit after SIGKILL."""
-    log = logging.getLogger(__name__)
+    """Log diagnostic info for a process that failed to exit after SIGKILL.
+    Will return a pid file descriptor for the process with PID `pid` if it is
+    still alive. If the process has already exited we will receive either a
+    `ProcessLookupError` exception or and an `OSError` exception with errno `EINVAL`.
+    In these cases, we will return `None`.
 
-    # Confirm we can still see this PID at all (catches namespace issues).
+    Any other error while calling the system call, will raise an OSError
+    exception.
+    """
+    log = logging.getLogger(__name__)
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if pidfd_open is None:
+        return None
+
     try:
         os.kill(pid, 0)
         log.error("Process %d kill -0: still visible", pid)
@@ -501,6 +511,35 @@ def dump_proc_state(pid):
             )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
+
+
+def _process_is_running(pid: int) -> bool:
+    """Best-effort check whether a process is still running.
+
+    Used as a fallback when `os.pidfd_open` is not available in the Python
+    build that executes integration tests.
+    """
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        stat = stat_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Fall back to signal-based probing in unexpected /proc failure cases.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    # `/proc/<pid>/stat` format: pid (comm) state ...
+    parts = stat.split()
+    if len(parts) > 2 and parts[2] == "Z":
+        return False
+
+    return True
 
 
 def wait_process_termination(p_pid, timeout=10.0):
