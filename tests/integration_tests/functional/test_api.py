@@ -1090,6 +1090,79 @@ def test_api_balloon(uvm_nano):
         test_microvm.api.balloon.patch(amount_mib=33554432)
 
 
+def _patch_agent_runtime(test_microvm, **kwargs):
+    return test_microvm.api.vm.request("PATCH", "/agent/runtime", **kwargs)
+
+
+def test_api_agent_runtime_happy_path(uvm_nano):
+    """Enter/exit LLM wait mode and verify VM remains usable."""
+    test_microvm = uvm_nano
+    test_microvm.api.balloon.put(
+        amount_mib=1, deflate_on_oom=True, free_page_hinting=True
+    )
+    test_microvm.add_net_iface()
+    test_microvm.start()
+
+    _patch_agent_runtime(
+        test_microvm,
+        state="LlmWaiting",
+        target_balloon_mib=16,
+        acknowledge_on_stop=True,
+    )
+    response = test_microvm.api.balloon.get()
+    assert response.json()["amount_mib"] == 16
+
+    _patch_agent_runtime(test_microvm, state="Running")
+    response = test_microvm.api.balloon.get()
+    assert response.json()["amount_mib"] == 1
+
+    test_microvm.ssh.check_output("true")
+
+
+def test_api_agent_runtime_without_balloon(uvm_nano):
+    """Entering LLM wait mode should fail when balloon is not configured."""
+    test_microvm = uvm_nano
+    test_microvm.add_net_iface()
+    test_microvm.start()
+
+    with pytest.raises(
+        RuntimeError, match="Agent runtime requires a configured balloon device"
+    ):
+        _patch_agent_runtime(
+            test_microvm,
+            state="LlmWaiting",
+            target_balloon_mib=16,
+            acknowledge_on_stop=True,
+        )
+
+
+def test_api_agent_runtime_idempotent(uvm_nano):
+    """Repeated enter/exit requests should stay successful."""
+    test_microvm = uvm_nano
+    test_microvm.api.balloon.put(
+        amount_mib=2, deflate_on_oom=True, free_page_hinting=True
+    )
+    test_microvm.add_net_iface()
+    test_microvm.start()
+
+    _patch_agent_runtime(
+        test_microvm,
+        state="LlmWaiting",
+        target_balloon_mib=12,
+        acknowledge_on_stop=True,
+    )
+    _patch_agent_runtime(
+        test_microvm,
+        state="LlmWaiting",
+        target_balloon_mib=12,
+        acknowledge_on_stop=True,
+    )
+    assert test_microvm.api.balloon.get().json()["amount_mib"] == 12
+
+    _patch_agent_runtime(test_microvm, state="Running")
+    _patch_agent_runtime(test_microvm, state="Running")
+    assert test_microvm.api.balloon.get().json()["amount_mib"] == 2
+
 def test_pmem_api(uvm_plain_any, rootfs):
     """
     Test virtio-pmem API commands
