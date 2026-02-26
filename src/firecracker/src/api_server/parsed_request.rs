@@ -346,6 +346,7 @@ pub mod tests {
     use vmm::builder::StartMicrovmError;
     use vmm::cpu_config::templates::test_utils::build_test_template;
     use vmm::devices::virtio::balloon::device::HintingStatus;
+    use vmm::vmm_config::agent_runtime::EnterLlmWaitConfig;
     use vmm::resources::VmmConfig;
     use vmm::rpc_interface::VmmActionError;
     use vmm::vmm_config::balloon::{BalloonDeviceConfig, BalloonStats};
@@ -1009,6 +1010,64 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_patch_agent_runtime() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+
+        let body = "{ \"state\": \"LlmWaiting\", \"target_balloon_mib\": 512, \
+                    \"acknowledge_on_stop\": true }";
+        sender
+            .write_all(http_request("PATCH", "/agent/runtime", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed),
+            VmmAction::EnterLlmWait(EnterLlmWaitConfig {
+                target_balloon_mib: Some(512),
+                acknowledge_on_stop: Some(true),
+            })
+        );
+
+        let body = "{ \"state\": \"Running\" }";
+        sender
+            .write_all(http_request("PATCH", "/agent/runtime", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(vmm_action_from_request(parsed), VmmAction::ExitLlmWait);
+    }
+
+    #[test]
+    fn test_try_from_patch_agent_runtime_invalid_route_and_body() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+
+        sender
+            .write_all(http_request("PATCH", "/agent", Some("{\"state\":\"Running\"}")).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed_request = ParsedRequest::try_from(&req);
+        assert!(matches!(
+            parsed_request,
+            Err(RequestError::InvalidPathMethod(path, Method::Patch)) if path == "agent"
+        ));
+
+        sender
+            .write_all(http_request("PATCH", "/agent/runtime", Some("{\"bad\":true}")).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(matches!(
+            ParsedRequest::try_from(&req),
+            Err(RequestError::SerdeJson(_))
+        ));
     }
 
     #[test]
