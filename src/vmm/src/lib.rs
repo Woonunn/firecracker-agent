@@ -123,7 +123,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
-use device_manager::DeviceManager;
+use device_manager::{DeviceManager, FindDeviceError};
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use seccomp::BpfProgram;
 use snapshot::Persist;
@@ -270,6 +270,8 @@ pub enum VmmError {
     Balloon(#[from] BalloonError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
+    /// Agent runtime requires a configured balloon device.
+    AgentRuntimeBalloonNotConfigured,
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -552,14 +554,37 @@ impl Vmm {
     }
 
     /// Transitions the microVM into an LLM wait mode.
-    pub fn enter_llm_wait(&mut self, _config: EnterLlmWaitConfig) -> Result<(), VmmError> {
+    pub fn enter_llm_wait(&mut self, config: EnterLlmWaitConfig) -> Result<(), VmmError> {
         if self.in_llm_wait {
             info!("Ignoring duplicate EnterLlmWait request.");
             return Ok(());
         }
 
+        let prev_balloon_mib = self.balloon_config().map_err(|err| match err {
+            VmmError::FindDeviceError(FindDeviceError::DeviceNotFound) => {
+                VmmError::AgentRuntimeBalloonNotConfigured
+            }
+            other => other,
+        })?;
+        let prev_balloon_mib = prev_balloon_mib.amount_mib;
+        let target_balloon_mib = config.target_balloon_mib.unwrap_or(prev_balloon_mib);
+        let start_cmd = StartHintingCmd {
+            acknowledge_on_stop: config.acknowledge_on_stop.unwrap_or(true),
+        };
+
+        self.update_balloon_config(target_balloon_mib)?;
+        if let Err(err) = self.start_balloon_hinting(start_cmd) {
+            if let Err(restore_err) = self.update_balloon_config(prev_balloon_mib) {
+                warn!(
+                    "Failed to restore balloon to {} MiB after EnterLlmWait error: {:?}",
+                    prev_balloon_mib, restore_err
+                );
+            }
+            return Err(err);
+        }
+
         self.in_llm_wait = true;
-        self.prev_balloon_mib = None;
+        self.prev_balloon_mib = Some(prev_balloon_mib);
         info!("MicroVM entered LLM wait mode.");
         Ok(())
     }
@@ -571,6 +596,10 @@ impl Vmm {
             info!("Ignoring duplicate ExitLlmWait request.");
             return Ok(());
         }
+
+        let restore_balloon_mib = self.prev_balloon_mib.unwrap_or(0);
+        self.stop_balloon_hinting()?;
+        self.update_balloon_config(restore_balloon_mib)?;
 
         self.in_llm_wait = false;
         self.prev_balloon_mib = None;
@@ -924,47 +953,38 @@ mod tests {
     use crate::builder::tests::default_vmm;
 
     #[test]
-    fn test_enter_llm_wait_is_idempotent() {
+    fn test_enter_llm_wait_without_balloon_fails() {
         let mut vmm = default_vmm();
         let config = EnterLlmWaitConfig {
             target_balloon_mib: Some(256),
             acknowledge_on_stop: Some(true),
         };
 
+        let err = vmm.enter_llm_wait(config).unwrap_err();
+        assert!(matches!(err, VmmError::AgentRuntimeBalloonNotConfigured));
         assert!(!vmm.in_llm_wait);
-        assert_eq!(vmm.prev_balloon_mib, None);
-
-        vmm.enter_llm_wait(config.clone()).unwrap();
-        assert!(vmm.in_llm_wait);
-        assert_eq!(vmm.prev_balloon_mib, None);
-
-        vmm.enter_llm_wait(config).unwrap();
-        assert!(vmm.in_llm_wait);
         assert_eq!(vmm.prev_balloon_mib, None);
     }
 
     #[test]
-    fn test_exit_llm_wait_is_idempotent() {
+    fn test_enter_llm_wait_is_idempotent_when_already_waiting() {
         let mut vmm = default_vmm();
         let config = EnterLlmWaitConfig {
-            target_balloon_mib: None,
-            acknowledge_on_stop: None,
+            target_balloon_mib: Some(256),
+            acknowledge_on_stop: Some(true),
         };
 
+        vmm.in_llm_wait = true;
         vmm.prev_balloon_mib = Some(128);
-        vmm.exit_llm_wait().unwrap();
-        assert!(!vmm.in_llm_wait);
-        assert_eq!(vmm.prev_balloon_mib, None);
-
         vmm.enter_llm_wait(config).unwrap();
         assert!(vmm.in_llm_wait);
+        assert_eq!(vmm.prev_balloon_mib, Some(128));
+    }
 
-        vmm.prev_balloon_mib = Some(256);
-        vmm.exit_llm_wait().unwrap();
-        assert!(!vmm.in_llm_wait);
-        assert_eq!(vmm.prev_balloon_mib, None);
-
-        vmm.prev_balloon_mib = Some(64);
+    #[test]
+    fn test_exit_llm_wait_is_idempotent_when_not_waiting() {
+        let mut vmm = default_vmm();
+        vmm.prev_balloon_mib = Some(128);
         vmm.exit_llm_wait().unwrap();
         assert!(!vmm.in_llm_wait);
         assert_eq!(vmm.prev_balloon_mib, None);

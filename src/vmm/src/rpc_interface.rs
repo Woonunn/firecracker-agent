@@ -1330,18 +1330,17 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_agent_runtime_idempotent() {
+    fn test_runtime_agent_runtime_without_balloon() {
         let res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
             target_balloon_mib: Some(256),
             acknowledge_on_stop: Some(true),
         }));
-        assert_eq!(res.unwrap(), VmmData::Empty);
-
-        let res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
-            target_balloon_mib: Some(256),
-            acknowledge_on_stop: Some(true),
-        }));
-        assert_eq!(res.unwrap(), VmmData::Empty);
+        assert!(matches!(
+            res,
+            Err(VmmActionError::InternalVmm(
+                VmmError::AgentRuntimeBalloonNotConfigured
+            ))
+        ));
 
         let res = runtime_request(VmmAction::ExitLlmWait);
         assert_eq!(res.unwrap(), VmmData::Empty);
