@@ -1369,11 +1369,20 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_agent_runtime_noop() {
+    fn test_runtime_agent_runtime_idempotent() {
         let res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
             target_balloon_mib: Some(256),
             acknowledge_on_stop: Some(true),
         }));
+        assert_eq!(res.unwrap(), VmmData::Empty);
+
+        let res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
+            target_balloon_mib: Some(256),
+            acknowledge_on_stop: Some(true),
+        }));
+        assert_eq!(res.unwrap(), VmmData::Empty);
+
+        let res = runtime_request(VmmAction::ExitLlmWait);
         assert_eq!(res.unwrap(), VmmData::Empty);
 
         let res = runtime_request(VmmAction::ExitLlmWait);
