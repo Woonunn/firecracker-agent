@@ -11,6 +11,7 @@ use vmm::rpc_interface::{VmmAction, VmmActionError, VmmData};
 
 use super::ApiServer;
 use super::request::actions::parse_put_actions;
+use super::request::agent_runtime::parse_patch_agent_runtime;
 use super::request::balloon::{parse_get_balloon, parse_patch_balloon, parse_put_balloon};
 use super::request::boot_source::parse_put_boot_source;
 use super::request::cpu_configuration::parse_put_cpu_config;
@@ -119,6 +120,9 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Patch, "mmds", Some(body)) => parse_patch_mmds(body),
             (Method::Patch, "network-interfaces", Some(body)) => {
                 parse_patch_net(body, path_tokens.next())
+            }
+            (Method::Patch, "agent", Some(body)) if path_tokens.next() == Some("runtime") => {
+                parse_patch_agent_runtime(body)
             }
             (Method::Patch, "vm", Some(body)) => parse_patch_vm_state(body),
             (Method::Patch, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {

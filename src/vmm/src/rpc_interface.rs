@@ -21,6 +21,7 @@ use crate::mmds::data_store::{self, Mmds, MmdsDatastoreError};
 use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
+use crate::vmm_config::agent_runtime::EnterLlmWaitConfig;
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -101,6 +102,10 @@ pub enum VmmAction {
     PutCpuConfiguration(CustomCpuTemplate),
     /// Resume the guest, by resuming the microVM VCPUs.
     Resume,
+    /// Transition the guest into an LLM wait state.
+    EnterLlmWait(EnterLlmWaitConfig),
+    /// Transition the guest out of an LLM wait state.
+    ExitLlmWait,
     /// Set the balloon device or update the one that already exists using the
     /// `BalloonDeviceConfig` as input. This action can only be called before the microVM
     /// has booted.
@@ -495,7 +500,9 @@ impl<'a> PrebootApiController<'a> {
             | UpdateNetworkInterface(_)
             | StartFreePageHinting(_)
             | GetFreePageHintingStatus
-            | StopFreePageHinting => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | StopFreePageHinting
+            | EnterLlmWait(_)
+            | ExitLlmWait => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -749,6 +756,9 @@ impl RuntimeApiController {
                 value,
             ),
             Resume => self.resume(),
+            EnterLlmWait(_) | ExitLlmWait => Err(VmmActionError::NotSupported(
+                "agent runtime control is not implemented".to_string(),
+            )),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => self.send_ctrl_alt_del(),
             UpdateBalloon(balloon_update) => self
@@ -1182,6 +1192,13 @@ mod tests {
                 requested_size_mib: 0,
             },
         )));
+        check_unsupported(preboot_request(VmmAction::EnterLlmWait(
+            EnterLlmWaitConfig {
+                target_balloon_mib: None,
+                acknowledge_on_stop: None,
+            },
+        )));
+        check_unsupported(preboot_request(VmmAction::ExitLlmWait));
     }
 
     fn runtime_request(request: VmmAction) -> Result<VmmData, VmmActionError> {
@@ -1299,5 +1316,17 @@ mod tests {
         check_unsupported(runtime_request(VmmAction::SetMemoryHotplugDevice(
             MemoryHotplugConfig::default(),
         )));
+    }
+
+    #[test]
+    fn test_runtime_not_supported() {
+        let res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
+            target_balloon_mib: Some(256),
+            acknowledge_on_stop: Some(true),
+        }));
+        assert!(matches!(res, Err(VmmActionError::NotSupported(_))), "{:?}", res);
+
+        let res = runtime_request(VmmAction::ExitLlmWait);
+        assert!(matches!(res, Err(VmmActionError::NotSupported(_))), "{:?}", res);
     }
 }

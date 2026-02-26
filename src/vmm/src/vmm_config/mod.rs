@@ -10,6 +10,8 @@ use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenBucket};
 
 /// Wrapper for configuring the balloon device.
 pub mod balloon;
+/// Wrapper for configuring agent-assisted runtime state.
+pub mod agent_runtime;
 /// Wrapper for configuring the microVM boot source.
 pub mod boot_source;
 /// Wrapper for configuring the block devices.
