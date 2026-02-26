@@ -385,8 +385,12 @@ def get_process_pidfd(pid):
     Any other error while calling the system call, will raise an OSError
     exception.
     """
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if pidfd_open is None:
+        return None
+
     try:
-        pidfd = os.pidfd_open(pid)
+        pidfd = pidfd_open(pid)
     except ProcessLookupError:
         return None
     except OSError as err:
@@ -398,6 +402,35 @@ def get_process_pidfd(pid):
     return pidfd
 
 
+def _process_is_running(pid: int) -> bool:
+    """Best-effort check whether a process is still running.
+
+    Used as a fallback when `os.pidfd_open` is not available in the Python
+    build that executes integration tests.
+    """
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        stat = stat_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Fall back to signal-based probing in unexpected /proc failure cases.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    # `/proc/<pid>/stat` format: pid (comm) state ...
+    parts = stat.split()
+    if len(parts) > 2 and parts[2] == "Z":
+        return False
+
+    return True
+
+
 def wait_process_termination(p_pid):
     """Wait for a process to terminate.
 
@@ -407,13 +440,21 @@ def wait_process_termination(p_pid):
     """
     pidfd = get_process_pidfd(p_pid)
 
-    # If pidfd is None the process has already terminated
-    if pidfd is not None:
-        epoll = select.epoll()
-        epoll.register(pidfd, select.EPOLLIN)
-        # This will return once the process exits
-        epoll.poll()
-        os.close(pidfd)
+    # If pidfd is None, either the process already terminated or pidfd APIs are
+    # unavailable in this Python build.
+    if pidfd is None:
+        if hasattr(os, "pidfd_open"):
+            return
+
+        while _process_is_running(p_pid):
+            time.sleep(0.05)
+        return
+
+    epoll = select.epoll()
+    epoll.register(pidfd, select.EPOLLIN)
+    # This will return once the process exits
+    epoll.poll()
+    os.close(pidfd)
 
 
 def get_firecracker_version_from_toml():
