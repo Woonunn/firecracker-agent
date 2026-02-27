@@ -321,7 +321,7 @@ pub fn build_microvm_for_boot(
         vcpus_exit_evt,
         device_manager,
         in_llm_wait: false,
-        prev_balloon_mib: None,
+        paused_by_llm_wait: false,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -525,7 +525,7 @@ pub fn build_microvm_from_snapshot(
         vcpus_exit_evt,
         device_manager,
         in_llm_wait: false,
-        prev_balloon_mib: None,
+        paused_by_llm_wait: false,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -848,7 +848,7 @@ pub(crate) mod tests {
             vcpus_exit_evt,
             device_manager: default_device_manager(),
             in_llm_wait: false,
-            prev_balloon_mib: None,
+            paused_by_llm_wait: false,
         }
     }
 

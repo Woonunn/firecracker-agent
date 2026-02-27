@@ -1094,12 +1094,66 @@ def _patch_agent_runtime(test_microvm, **kwargs):
     return test_microvm.api.vm.request("PATCH", "/agent/runtime", **kwargs)
 
 
+def _host_swap_enabled():
+    try:
+        with open("/proc/swaps", encoding="utf-8") as file:
+            return len([line for line in file.read().splitlines() if line.strip()]) > 1
+    except OSError:
+        return False
+
+
 def test_api_agent_runtime_happy_path(uvm_nano):
     """Enter/exit LLM wait mode and verify VM remains usable."""
+    if not _host_swap_enabled():
+        pytest.skip("Host swap is disabled; MADV_PAGEOUT reclaim is unavailable.")
+
     test_microvm = uvm_nano
-    test_microvm.api.balloon.put(
-        amount_mib=1, deflate_on_oom=True, free_page_hinting=True
-    )
+    test_microvm.add_net_iface()
+    test_microvm.start()
+
+    _patch_agent_runtime(test_microvm, state="LlmWaiting", pause_on_wait=True)
+
+    _patch_agent_runtime(test_microvm, state="Running")
+
+    test_microvm.ssh.check_output("true")
+
+
+def test_api_agent_runtime_without_swap(uvm_nano):
+    """Entering LLM wait mode fails when host swap is disabled."""
+    if _host_swap_enabled():
+        pytest.skip("Host swap is enabled; this negative test requires no swap.")
+
+    test_microvm = uvm_nano
+    test_microvm.add_net_iface()
+    test_microvm.start()
+
+    with pytest.raises(RuntimeError, match="Agent runtime requires host swap"):
+        _patch_agent_runtime(test_microvm, state="LlmWaiting")
+
+
+def test_api_agent_runtime_idempotent(uvm_nano):
+    """Repeated enter/exit requests should stay successful."""
+    if not _host_swap_enabled():
+        pytest.skip("Host swap is disabled; MADV_PAGEOUT reclaim is unavailable.")
+
+    test_microvm = uvm_nano
+    test_microvm.add_net_iface()
+    test_microvm.start()
+
+    _patch_agent_runtime(test_microvm, state="LlmWaiting", pause_on_wait=True)
+    _patch_agent_runtime(test_microvm, state="LlmWaiting", pause_on_wait=True)
+
+    _patch_agent_runtime(test_microvm, state="Running")
+    _patch_agent_runtime(test_microvm, state="Running")
+    test_microvm.ssh.check_output("true")
+
+
+def test_api_agent_runtime_deprecated_fields_are_accepted(uvm_nano):
+    """Deprecated balloon fields are accepted for compatibility and ignored."""
+    if not _host_swap_enabled():
+        pytest.skip("Host swap is disabled; MADV_PAGEOUT reclaim is unavailable.")
+
+    test_microvm = uvm_nano
     test_microvm.add_net_iface()
     test_microvm.start()
 
@@ -1109,59 +1163,9 @@ def test_api_agent_runtime_happy_path(uvm_nano):
         target_balloon_mib=16,
         acknowledge_on_stop=True,
     )
-    response = test_microvm.api.balloon.get()
-    assert response.json()["amount_mib"] == 16
-
     _patch_agent_runtime(test_microvm, state="Running")
-    response = test_microvm.api.balloon.get()
-    assert response.json()["amount_mib"] == 1
-
     test_microvm.ssh.check_output("true")
 
-
-def test_api_agent_runtime_without_balloon(uvm_nano):
-    """Entering LLM wait mode should fail when balloon is not configured."""
-    test_microvm = uvm_nano
-    test_microvm.add_net_iface()
-    test_microvm.start()
-
-    with pytest.raises(
-        RuntimeError, match="Agent runtime requires a configured balloon device"
-    ):
-        _patch_agent_runtime(
-            test_microvm,
-            state="LlmWaiting",
-            target_balloon_mib=16,
-            acknowledge_on_stop=True,
-        )
-
-
-def test_api_agent_runtime_idempotent(uvm_nano):
-    """Repeated enter/exit requests should stay successful."""
-    test_microvm = uvm_nano
-    test_microvm.api.balloon.put(
-        amount_mib=2, deflate_on_oom=True, free_page_hinting=True
-    )
-    test_microvm.add_net_iface()
-    test_microvm.start()
-
-    _patch_agent_runtime(
-        test_microvm,
-        state="LlmWaiting",
-        target_balloon_mib=12,
-        acknowledge_on_stop=True,
-    )
-    _patch_agent_runtime(
-        test_microvm,
-        state="LlmWaiting",
-        target_balloon_mib=12,
-        acknowledge_on_stop=True,
-    )
-    assert test_microvm.api.balloon.get().json()["amount_mib"] == 12
-
-    _patch_agent_runtime(test_microvm, state="Running")
-    _patch_agent_runtime(test_microvm, state="Running")
-    assert test_microvm.api.balloon.get().json()["amount_mib"] == 2
 
 def test_pmem_api(uvm_plain_any, rootfs):
     """

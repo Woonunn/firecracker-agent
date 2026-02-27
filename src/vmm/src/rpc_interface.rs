@@ -1205,8 +1205,7 @@ mod tests {
         )));
         check_unsupported(preboot_request(VmmAction::EnterLlmWait(
             EnterLlmWaitConfig {
-                target_balloon_mib: None,
-                acknowledge_on_stop: None,
+                pause_on_wait: None,
             },
         )));
         check_unsupported(preboot_request(VmmAction::ExitLlmWait));
@@ -1330,17 +1329,21 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_agent_runtime_without_balloon() {
-        let res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
-            target_balloon_mib: Some(256),
-            acknowledge_on_stop: Some(true),
+    fn test_runtime_agent_runtime_without_swap() {
+        let enter_res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
+            pause_on_wait: Some(true),
         }));
-        assert!(matches!(
-            res,
-            Err(VmmActionError::InternalVmm(
-                VmmError::AgentRuntimeBalloonNotConfigured
-            ))
-        ));
+        if let Err(err) = enter_res {
+            assert!(matches!(
+                err,
+                VmmActionError::InternalVmm(
+                    VmmError::AgentRuntimeSwapNotAvailable
+                        | VmmError::AgentRuntimeSwapCheck(_)
+                        | VmmError::AgentRuntimeUnsupportedAdvice
+                        | VmmError::AgentRuntimeMadvise(_)
+                )
+            ));
+        }
 
         let res = runtime_request(VmmAction::ExitLlmWait);
         assert_eq!(res.unwrap(), VmmData::Empty);

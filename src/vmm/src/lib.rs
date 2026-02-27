@@ -121,9 +121,9 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use device_manager::{DeviceManager, FindDeviceError};
+use device_manager::DeviceManager;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use seccomp::BpfProgram;
 use snapshot::Persist;
@@ -163,7 +163,7 @@ use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::agent_runtime::EnterLlmWaitConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
-use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::Vm;
@@ -270,8 +270,14 @@ pub enum VmmError {
     Balloon(#[from] BalloonError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
-    /// Agent runtime requires a configured balloon device.
-    AgentRuntimeBalloonNotConfigured,
+    /// Agent runtime requires host swap to be enabled.
+    AgentRuntimeSwapNotAvailable,
+    /// Failed to inspect host swap configuration: {0}
+    AgentRuntimeSwapCheck(io::Error),
+    /// Agent runtime madvise with MADV_PAGEOUT is not supported on this host kernel.
+    AgentRuntimeUnsupportedAdvice,
+    /// Agent runtime madvise call failed: {0}
+    AgentRuntimeMadvise(io::Error),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -280,6 +286,23 @@ pub type DirtyBitmap = HashMap<u32, Vec<u64>>;
 /// Returns the size of guest memory, in MiB.
 pub(crate) fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
     guest_memory.iter().map(|region| region.len()).sum::<u64>() >> 20
+}
+
+fn host_has_swap_enabled() -> Result<bool, io::Error> {
+    let swaps = std::fs::read_to_string("/proc/swaps")?;
+    Ok(host_has_swap_enabled_from_contents(&swaps))
+}
+
+fn host_has_swap_enabled_from_contents(swaps: &str) -> bool {
+    swaps.lines().skip(1).any(|line| !line.trim().is_empty())
+}
+
+fn process_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmRSS:")?;
+        value.split_whitespace().next()?.parse::<u64>().ok()
+    })
 }
 
 // Error type for [`Vmm::emulate_serial_init`].
@@ -334,8 +357,8 @@ pub struct Vmm {
     device_manager: DeviceManager,
     // Tracks whether the VM is currently in LLM wait mode.
     in_llm_wait: bool,
-    // Stores balloon size before entering LLM wait mode.
-    prev_balloon_mib: Option<u32>,
+    // Tracks whether this transition paused the VM and should resume it on exit.
+    paused_by_llm_wait: bool,
 }
 
 impl Vmm {
@@ -555,55 +578,108 @@ impl Vmm {
 
     /// Transitions the microVM into an LLM wait mode.
     pub fn enter_llm_wait(&mut self, config: EnterLlmWaitConfig) -> Result<(), VmmError> {
+        let has_swap = host_has_swap_enabled().map_err(VmmError::AgentRuntimeSwapCheck)?;
+        self.enter_llm_wait_with_swap(config, has_swap)
+    }
+
+    fn enter_llm_wait_with_swap(
+        &mut self,
+        config: EnterLlmWaitConfig,
+        has_swap: bool,
+    ) -> Result<(), VmmError> {
         if self.in_llm_wait {
             info!("Ignoring duplicate EnterLlmWait request.");
             return Ok(());
         }
 
-        let prev_balloon_mib = self.balloon_config().map_err(|err| match err {
-            VmmError::FindDeviceError(FindDeviceError::DeviceNotFound) => {
-                VmmError::AgentRuntimeBalloonNotConfigured
-            }
-            other => other,
-        })?;
-        let prev_balloon_mib = prev_balloon_mib.amount_mib;
-        let target_balloon_mib = config.target_balloon_mib.unwrap_or(prev_balloon_mib);
-        let start_cmd = StartHintingCmd {
-            acknowledge_on_stop: config.acknowledge_on_stop.unwrap_or(true),
-        };
+        if !has_swap {
+            return Err(VmmError::AgentRuntimeSwapNotAvailable);
+        }
 
-        self.update_balloon_config(target_balloon_mib)?;
-        if let Err(err) = self.start_balloon_hinting(start_cmd) {
-            if let Err(restore_err) = self.update_balloon_config(prev_balloon_mib) {
-                warn!(
-                    "Failed to restore balloon to {} MiB after EnterLlmWait error: {:?}",
-                    prev_balloon_mib, restore_err
-                );
+        self.paused_by_llm_wait = false;
+        let pause_on_wait = config.pause_on_wait.unwrap_or(true);
+        if pause_on_wait && self.instance_info.state == VmState::Running {
+            self.pause_vm()?;
+            self.paused_by_llm_wait = true;
+        }
+
+        let rss_before = process_rss_kib();
+        let reclaim_start = Instant::now();
+        if let Err(err) = self.reclaim_guest_memory_with_madvise() {
+            if self.paused_by_llm_wait {
+                if let Err(resume_err) = self.resume_vm() {
+                    warn!(
+                        "Failed to resume VM after EnterLlmWait reclaim error: {:?}",
+                        resume_err
+                    );
+                } else {
+                    self.paused_by_llm_wait = false;
+                }
             }
             return Err(err);
         }
+        let reclaim_elapsed_ms = reclaim_start.elapsed().as_millis();
+        let rss_after = process_rss_kib();
 
         self.in_llm_wait = true;
-        self.prev_balloon_mib = Some(prev_balloon_mib);
-        info!("MicroVM entered LLM wait mode.");
+        info!(
+            "MicroVM entered LLM wait mode. pause_on_wait={}, paused_by_llm_wait={}, reclaim_duration_ms={}, rss_before_kib={:?}, rss_after_kib={:?}",
+            pause_on_wait,
+            self.paused_by_llm_wait,
+            reclaim_elapsed_ms,
+            rss_before,
+            rss_after
+        );
         Ok(())
     }
 
     /// Transitions the microVM out of an LLM wait mode.
     pub fn exit_llm_wait(&mut self) -> Result<(), VmmError> {
         if !self.in_llm_wait {
-            self.prev_balloon_mib = None;
+            self.paused_by_llm_wait = false;
             info!("Ignoring duplicate ExitLlmWait request.");
             return Ok(());
         }
 
-        let restore_balloon_mib = self.prev_balloon_mib.unwrap_or(0);
-        self.stop_balloon_hinting()?;
-        self.update_balloon_config(restore_balloon_mib)?;
+        if self.paused_by_llm_wait && self.instance_info.state == VmState::Paused {
+            self.resume_vm()?;
+        }
 
         self.in_llm_wait = false;
-        self.prev_balloon_mib = None;
+        self.paused_by_llm_wait = false;
         info!("MicroVM exited LLM wait mode.");
+        Ok(())
+    }
+
+    fn reclaim_guest_memory_with_madvise(&self) -> Result<(), VmmError> {
+        for region in self.vm.guest_memory().iter() {
+            let len = usize::try_from(region.len()).map_err(|_| {
+                VmmError::AgentRuntimeMadvise(io::Error::other(
+                    "guest memory region length overflow",
+                ))
+            })?;
+            if len == 0 {
+                continue;
+            }
+
+            let host_addr = region
+                .get_host_address(MemoryRegionAddress(0))
+                .map_err(|err| VmmError::AgentRuntimeMadvise(io::Error::other(err.to_string())))?;
+
+            // SAFETY: `host_addr` points to a valid guest memory mapping and `len` is the exact
+            // region size, so the kernel can safely apply advice on this range.
+            let ret = unsafe {
+                libc::madvise(host_addr.cast(), len, libc::MADV_PAGEOUT)
+            };
+            if ret < 0 {
+                let os_error = io::Error::last_os_error();
+                if os_error.raw_os_error() == Some(libc::EINVAL) {
+                    return Err(VmmError::AgentRuntimeUnsupportedAdvice);
+                }
+                return Err(VmmError::AgentRuntimeMadvise(os_error));
+            }
+        }
+
         Ok(())
     }
 
@@ -953,40 +1029,68 @@ mod tests {
     use crate::builder::tests::default_vmm;
 
     #[test]
-    fn test_enter_llm_wait_without_balloon_fails() {
+    fn test_host_has_swap_enabled_from_contents() {
+        assert!(!host_has_swap_enabled_from_contents(
+            "Filename\tType\tSize\tUsed\tPriority\n"
+        ));
+        assert!(host_has_swap_enabled_from_contents(
+            "Filename\tType\tSize\tUsed\tPriority\n/dev/zram0\tpartition\t102396\t0\t100\n"
+        ));
+    }
+
+    #[test]
+    fn test_enter_llm_wait_without_swap_fails() {
         let mut vmm = default_vmm();
         let config = EnterLlmWaitConfig {
-            target_balloon_mib: Some(256),
-            acknowledge_on_stop: Some(true),
+            pause_on_wait: Some(true),
         };
 
-        let err = vmm.enter_llm_wait(config).unwrap_err();
-        assert!(matches!(err, VmmError::AgentRuntimeBalloonNotConfigured));
+        let err = vmm.enter_llm_wait_with_swap(config, false).unwrap_err();
+        assert!(matches!(err, VmmError::AgentRuntimeSwapNotAvailable));
         assert!(!vmm.in_llm_wait);
-        assert_eq!(vmm.prev_balloon_mib, None);
+        assert!(!vmm.paused_by_llm_wait);
     }
 
     #[test]
     fn test_enter_llm_wait_is_idempotent_when_already_waiting() {
         let mut vmm = default_vmm();
         let config = EnterLlmWaitConfig {
-            target_balloon_mib: Some(256),
-            acknowledge_on_stop: Some(true),
+            pause_on_wait: Some(true),
         };
 
         vmm.in_llm_wait = true;
-        vmm.prev_balloon_mib = Some(128);
-        vmm.enter_llm_wait(config).unwrap();
+        vmm.paused_by_llm_wait = true;
+        vmm.enter_llm_wait_with_swap(config, true).unwrap();
         assert!(vmm.in_llm_wait);
-        assert_eq!(vmm.prev_balloon_mib, Some(128));
+        assert!(vmm.paused_by_llm_wait);
+    }
+
+    #[test]
+    fn test_enter_llm_wait_without_pause_keeps_vm_running() {
+        let mut vmm = default_vmm();
+        let config = EnterLlmWaitConfig {
+            pause_on_wait: Some(false),
+        };
+
+        match vmm.enter_llm_wait_with_swap(config, true) {
+            Ok(()) => {
+                assert!(vmm.in_llm_wait);
+                assert!(!vmm.paused_by_llm_wait);
+                assert_eq!(vmm.instance_info.state, VmState::NotStarted);
+            }
+            Err(err) => assert!(matches!(
+                err,
+                VmmError::AgentRuntimeUnsupportedAdvice | VmmError::AgentRuntimeMadvise(_)
+            )),
+        }
     }
 
     #[test]
     fn test_exit_llm_wait_is_idempotent_when_not_waiting() {
         let mut vmm = default_vmm();
-        vmm.prev_balloon_mib = Some(128);
+        vmm.paused_by_llm_wait = true;
         vmm.exit_llm_wait().unwrap();
         assert!(!vmm.in_llm_wait);
-        assert_eq!(vmm.prev_balloon_mib, None);
+        assert!(!vmm.paused_by_llm_wait);
     }
 }

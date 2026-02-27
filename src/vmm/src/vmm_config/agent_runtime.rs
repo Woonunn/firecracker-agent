@@ -9,10 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct AgentRuntimeConfig {
     /// Target runtime state.
     pub state: AgentRuntimeState,
-    /// Optional target balloon size in MiB when entering `LlmWaiting`.
+    /// Optional pause behavior when entering `LlmWaiting`.
+    #[serde(default)]
+    pub pause_on_wait: Option<bool>,
+    /// Deprecated and ignored. Kept for backward compatibility.
     #[serde(default)]
     pub target_balloon_mib: Option<u32>,
-    /// Optional hinting behavior when ending wait mode.
+    /// Deprecated and ignored. Kept for backward compatibility.
     #[serde(default)]
     pub acknowledge_on_stop: Option<bool>,
 }
@@ -30,20 +33,15 @@ pub enum AgentRuntimeState {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnterLlmWaitConfig {
-    /// Optional target balloon size in MiB.
+    /// Optional pause behavior while reclaiming memory.
     #[serde(default)]
-    pub target_balloon_mib: Option<u32>,
-    /// Optional hinting behavior when ending wait mode.
-    #[serde(default)]
-    pub acknowledge_on_stop: Option<bool>,
+    pub pause_on_wait: Option<bool>,
 }
 
 impl From<AgentRuntimeConfig> for EnterLlmWaitConfig {
     fn from(value: AgentRuntimeConfig) -> Self {
         Self {
-            target_balloon_mib: value.target_balloon_mib,
-            acknowledge_on_stop: value.acknowledge_on_stop,
+            pause_on_wait: value.pause_on_wait,
         }
     }
 }
-

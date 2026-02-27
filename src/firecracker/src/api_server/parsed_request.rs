@@ -1026,10 +1026,28 @@ pub mod tests {
         let req = connection.pop_parsed_request().unwrap();
         let parsed = ParsedRequest::try_from(&req).unwrap();
         assert_eq!(
+            depr_action_from_req(
+                parsed,
+                Some(
+                    "PATCH /agent/runtime: target_balloon_mib and acknowledge_on_stop fields are deprecated and ignored.".to_string()
+                )
+            ),
+            VmmAction::EnterLlmWait(EnterLlmWaitConfig {
+                pause_on_wait: None,
+            })
+        );
+
+        let body = "{ \"state\": \"LlmWaiting\", \"pause_on_wait\": false }";
+        sender
+            .write_all(http_request("PATCH", "/agent/runtime", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(
             vmm_action_from_request(parsed),
             VmmAction::EnterLlmWait(EnterLlmWaitConfig {
-                target_balloon_mib: Some(512),
-                acknowledge_on_stop: Some(true),
+                pause_on_wait: Some(false),
             })
         );
 

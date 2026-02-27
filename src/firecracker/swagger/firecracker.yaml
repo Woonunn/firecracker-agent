@@ -65,6 +65,7 @@ paths:
       summary: Updates the agent runtime state.
       description:
         Sets the desired runtime state (LlmWaiting or Running) for agent-aware memory reclamation.
+        Entering LlmWaiting triggers host-side madvise-based reclaim.
       operationId: patchAgentRuntime
       parameters:
         - name: body
@@ -1344,14 +1345,19 @@ definitions:
         enum:
           - LlmWaiting
           - Running
+      pause_on_wait:
+        type: boolean
+        default: true
+        description: Optional flag to pause vCPUs before reclaiming memory.
       target_balloon_mib:
         type: integer
         minimum: 0
-        description: Optional target balloon size in MiB when entering LlmWaiting state.
+        deprecated: true
+        description: Deprecated and ignored. Kept for backward compatibility.
       acknowledge_on_stop:
         type: boolean
-        default: true
-        description: Optional hinting behavior flag used when leaving LlmWaiting state.
+        deprecated: true
+        description: Deprecated and ignored. Kept for backward compatibility.
 
   InstanceActionInfo:
     type: object
