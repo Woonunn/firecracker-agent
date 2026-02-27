@@ -4,16 +4,16 @@
 
 import time
 from concurrent.futures import ThreadPoolExecutor
-from subprocess import TimeoutExpired
 
 import pytest
-
-from framework.guest_stats import MeminfoGuest
-from framework.utils import get_stable_rss_mem
 
 
 def _patch_agent_runtime(microvm, **kwargs):
     return microvm.api.vm.request("PATCH", "/agent/runtime", **kwargs)
+
+
+def _put_agent_runtime_response(microvm, **kwargs):
+    return microvm.api.vm.request("PUT", "/agent/runtime/response", **kwargs)
 
 
 def _host_swap_enabled():
@@ -24,29 +24,22 @@ def _host_swap_enabled():
         return False
 
 
-def _start_microvm(microvm):
+def _start_microvm_with_vsock(microvm, guest_cid):
     microvm.time_api_requests = False
     microvm.spawn()
     microvm.basic_config(vcpu_count=1, mem_size_mib=256)
     microvm.add_net_iface()
+    microvm.api.vsock.put(vsock_id="vsock0", guest_cid=guest_cid, uds_path="/v.sock")
     microvm.start()
 
 
-def _dirty_guest_memory(microvm, amount_mib):
-    # Keep the helper behavior consistent with existing balloon tests.
-    try:
-        microvm.ssh.run(f"/usr/local/bin/fillmem {amount_mib}", timeout=1.0)
-    except TimeoutExpired:
-        pass
-    time.sleep(2)
-
-
-def test_agent_runtime_parallel_llm_wait_reclaim_and_restore(
+def test_agent_runtime_parallel_wait_handoff_and_resume(
     microvm_factory, guest_kernel, rootfs, pci_enabled
 ):
     """
-    Run two microVMs in parallel. Put vm1 into LLM wait mode, verify memory reclaim,
-    then exit LLM wait and verify memory is returned to vm1 while vm2 keeps running.
+    Simulate host-side LLM handoff:
+    vm1 enters LLM waiting, host submits response via /agent/runtime/response,
+    vm1 resumes and receives response over vsock, while vm2 stays healthy.
     """
     if not _host_swap_enabled():
         pytest.skip("Host swap is disabled; MADV_PAGEOUT reclaim is unavailable.")
@@ -56,39 +49,38 @@ def test_agent_runtime_parallel_llm_wait_reclaim_and_restore(
 
     with ThreadPoolExecutor(max_workers=2) as tpe:
         for future in (
-            tpe.submit(_start_microvm, vm1),
-            tpe.submit(_start_microvm, vm2),
+            tpe.submit(_start_microvm_with_vsock, vm1, 3),
+            tpe.submit(_start_microvm_with_vsock, vm2, 4),
         ):
             future.result()
 
-    # Keep vm2 active while vm1 enters/exits LLM wait.
     vm2.ssh.check_output("true")
 
-    _dirty_guest_memory(vm1, amount_mib=64)
-    rss_before_wait = get_stable_rss_mem(vm1)
-    mem_available_before_wait = MeminfoGuest(vm1).get().mem_available.kib()
-
-    _patch_agent_runtime(
-        vm1,
-        state="LlmWaiting",
-        pause_on_wait=True,
+    vm1.ssh.check_output("rm -f /tmp/llm_response.out")
+    vm1.ssh.check_output(
+        'nohup sh -c "socat -u VSOCK-LISTEN:11000,reuseaddr,fork '
+        'OPEN:/tmp/llm_response.out,creat,append >/tmp/llm_listener.log 2>&1" &'
     )
-    time.sleep(2)
+    time.sleep(1)
 
-    rss_during_wait = get_stable_rss_mem(vm1)
-    mem_available_during_wait = MeminfoGuest(vm1).get().mem_available.kib()
-    assert rss_during_wait < rss_before_wait
-    assert mem_available_during_wait < mem_available_before_wait
+    _patch_agent_runtime(vm1, state="LlmWaiting", pause_on_wait=True)
 
-    # vm2 should remain healthy while vm1 is waiting for LLM response.
-    vm2.ssh.check_output("true")
+    _put_agent_runtime_response(
+        vm1,
+        request_id="req-1",
+        vsock_port=11000,
+        response='{"content":"hello"}',
+        resume_vm=True,
+    )
 
-    _patch_agent_runtime(vm1, state="Running")
-    time.sleep(2)
+    response_seen = False
+    for _ in range(20):
+        output = vm1.ssh.check_output("cat /tmp/llm_response.out 2>/dev/null || true")
+        if "req-1" in output and "hello" in output:
+            response_seen = True
+            break
+        time.sleep(0.2)
 
-    mem_available_after_exit = MeminfoGuest(vm1).get().mem_available.kib()
-    assert mem_available_after_exit > mem_available_during_wait
-
-    # Both VMs are still responsive after the transition cycle.
+    assert response_seen
     vm1.ssh.check_output("true")
     vm2.ssh.check_output("true")

@@ -42,6 +42,20 @@
 - `target_balloon_mib`：**deprecated**，忽略。
 - `acknowledge_on_stop`：**deprecated**，忽略。
 
+`PUT /agent/runtime/response` 请求体：
+
+```json
+{
+  "request_id": "req-1",
+  "vsock_port": 11000,
+  "response": "{\"ok\":true}",
+  "resume_vm": true
+}
+```
+
+- host proxy 在外部 LLM/网络响应到达后调用该接口；
+- `resume_vm=true` 时会先退出等待态，再把响应通过 vsock 回交给 guest。
+
 兼容策略：
 
 - 保留旧字段以避免调用方立即升级失败。
@@ -71,6 +85,13 @@
 2. 若 `paused_by_llm_wait=true` 且当前状态仍为 Paused：
    - 调用 `resume_vm()`。
 3. 清理状态：`in_llm_wait=false`、`paused_by_llm_wait=false`。
+
+#### SubmitLlmResponse（新增）
+
+1. host 通过 `PUT /agent/runtime/response` 提交响应。
+2. 若 `resume_vm=true`（默认），先执行 `ExitLlmWait`。
+3. 组装回传负载：`{"request_id":"...","response":"..."}`。
+4. 通过 `<uds_path>_<vsock_port>` 将响应写入 guest vsock listener。
 
 ---
 
