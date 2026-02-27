@@ -6,6 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from subprocess import TimeoutExpired
 
+import pytest
+
 from framework.guest_stats import MeminfoGuest
 from framework.utils import get_stable_rss_mem
 
@@ -14,17 +16,19 @@ def _patch_agent_runtime(microvm, **kwargs):
     return microvm.api.vm.request("PATCH", "/agent/runtime", **kwargs)
 
 
-def _start_microvm_with_balloon(microvm):
+def _host_swap_enabled():
+    try:
+        with open("/proc/swaps", encoding="utf-8") as file:
+            return len([line for line in file.read().splitlines() if line.strip()]) > 1
+    except OSError:
+        return False
+
+
+def _start_microvm(microvm):
     microvm.time_api_requests = False
     microvm.spawn()
     microvm.basic_config(vcpu_count=1, mem_size_mib=256)
     microvm.add_net_iface()
-    microvm.api.balloon.put(
-        amount_mib=2,
-        deflate_on_oom=True,
-        stats_polling_interval_s=1,
-        free_page_hinting=True,
-    )
     microvm.start()
 
 
@@ -44,13 +48,16 @@ def test_agent_runtime_parallel_llm_wait_reclaim_and_restore(
     Run two microVMs in parallel. Put vm1 into LLM wait mode, verify memory reclaim,
     then exit LLM wait and verify memory is returned to vm1 while vm2 keeps running.
     """
+    if not _host_swap_enabled():
+        pytest.skip("Host swap is disabled; MADV_PAGEOUT reclaim is unavailable.")
+
     vm1 = microvm_factory.build(guest_kernel, rootfs, pci=pci_enabled)
     vm2 = microvm_factory.build(guest_kernel, rootfs, pci=pci_enabled)
 
     with ThreadPoolExecutor(max_workers=2) as tpe:
         for future in (
-            tpe.submit(_start_microvm_with_balloon, vm1),
-            tpe.submit(_start_microvm_with_balloon, vm2),
+            tpe.submit(_start_microvm, vm1),
+            tpe.submit(_start_microvm, vm2),
         ):
             future.result()
 
@@ -64,14 +71,12 @@ def test_agent_runtime_parallel_llm_wait_reclaim_and_restore(
     _patch_agent_runtime(
         vm1,
         state="LlmWaiting",
-        target_balloon_mib=128,
-        acknowledge_on_stop=True,
+        pause_on_wait=True,
     )
     time.sleep(2)
 
     rss_during_wait = get_stable_rss_mem(vm1)
     mem_available_during_wait = MeminfoGuest(vm1).get().mem_available.kib()
-    assert vm1.api.balloon.get().json()["amount_mib"] == 128
     assert rss_during_wait < rss_before_wait
     assert mem_available_during_wait < mem_available_before_wait
 
@@ -82,7 +87,6 @@ def test_agent_runtime_parallel_llm_wait_reclaim_and_restore(
     time.sleep(2)
 
     mem_available_after_exit = MeminfoGuest(vm1).get().mem_available.kib()
-    assert vm1.api.balloon.get().json()["amount_mib"] == 2
     assert mem_available_after_exit > mem_available_during_wait
 
     # Both VMs are still responsive after the transition cycle.
