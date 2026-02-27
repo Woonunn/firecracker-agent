@@ -1094,6 +1094,10 @@ def _patch_agent_runtime(test_microvm, **kwargs):
     return test_microvm.api.vm.request("PATCH", "/agent/runtime", **kwargs)
 
 
+def _put_agent_runtime_response(test_microvm, **kwargs):
+    return test_microvm.api.vm.request("PUT", "/agent/runtime/response", **kwargs)
+
+
 def _host_swap_enabled():
     try:
         with open("/proc/swaps", encoding="utf-8") as file:
@@ -1165,6 +1169,22 @@ def test_api_agent_runtime_deprecated_fields_are_accepted(uvm_nano):
     )
     _patch_agent_runtime(test_microvm, state="Running")
     test_microvm.ssh.check_output("true")
+
+
+def test_api_agent_runtime_submit_response_without_vsock(uvm_nano):
+    """Submitting response without vsock should fail with a clear error."""
+    test_microvm = uvm_nano
+    test_microvm.add_net_iface()
+    test_microvm.start()
+
+    with pytest.raises(RuntimeError, match="requires a configured vsock device"):
+        _put_agent_runtime_response(
+            test_microvm,
+            request_id="req-1",
+            vsock_port=11000,
+            response="{\"ok\":true}",
+            resume_vm=False,
+        )
 
 
 def test_pmem_api(uvm_plain_any, rootfs):

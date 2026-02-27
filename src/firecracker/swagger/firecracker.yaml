@@ -90,6 +90,33 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /agent/runtime/response:
+    put:
+      summary: Submits an LLM response payload and resumes the VM.
+      description:
+        Called by host-side orchestration after external IO/LLM completes.
+        Firecracker optionally leaves LlmWaiting and forwards the response to the
+        guest over vsock.
+      operationId: putAgentRuntimeResponse
+      parameters:
+        - name: body
+          in: body
+          description: The LLM response payload and delivery target.
+          required: true
+          schema:
+            $ref: "#/definitions/AgentRuntimeResponse"
+      responses:
+        204:
+          description: Agent runtime response submitted
+        400:
+          description: Agent runtime response cannot be processed due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /balloon:
     get:
       summary: Returns the current balloon device configuration.
@@ -1358,6 +1385,31 @@ definitions:
         type: boolean
         deprecated: true
         description: Deprecated and ignored. Kept for backward compatibility.
+
+  AgentRuntimeResponse:
+    type: object
+    description:
+      Host-submitted response that is delivered to a guest vsock listener.
+    required:
+      - request_id
+      - vsock_port
+      - response
+    properties:
+      request_id:
+        type: string
+        description: Request identifier used for guest-side correlation.
+      vsock_port:
+        type: integer
+        minimum: 0
+        maximum: 4294967295
+        description: Guest vsock listening port that receives the response payload.
+      response:
+        type: string
+        description: Response payload serialized by host orchestration.
+      resume_vm:
+        type: boolean
+        default: true
+        description: If true, transition VM to Running before delivering response.
 
   InstanceActionInfo:
     type: object

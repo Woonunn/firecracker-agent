@@ -21,7 +21,7 @@ use crate::mmds::data_store::{self, Mmds, MmdsDatastoreError};
 use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
-use crate::vmm_config::agent_runtime::EnterLlmWaitConfig;
+use crate::vmm_config::agent_runtime::{EnterLlmWaitConfig, SubmitLlmResponseConfig};
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -106,6 +106,8 @@ pub enum VmmAction {
     EnterLlmWait(EnterLlmWaitConfig),
     /// Transition the guest out of an LLM wait state.
     ExitLlmWait,
+    /// Submit an LLM response payload and optionally resume the guest.
+    SubmitLlmResponse(SubmitLlmResponseConfig),
     /// Set the balloon device or update the one that already exists using the
     /// `BalloonDeviceConfig` as input. This action can only be called before the microVM
     /// has booted.
@@ -502,7 +504,8 @@ impl<'a> PrebootApiController<'a> {
             | GetFreePageHintingStatus
             | StopFreePageHinting
             | EnterLlmWait(_)
-            | ExitLlmWait => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | ExitLlmWait
+            | SubmitLlmResponse(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -768,6 +771,13 @@ impl RuntimeApiController {
                 .lock()
                 .expect("Poisoned lock")
                 .exit_llm_wait()
+                .map(|_| VmmData::Empty)
+                .map_err(VmmActionError::InternalVmm),
+            SubmitLlmResponse(config) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .submit_llm_response(config)
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::InternalVmm),
             #[cfg(target_arch = "x86_64")]
@@ -1209,6 +1219,14 @@ mod tests {
             },
         )));
         check_unsupported(preboot_request(VmmAction::ExitLlmWait));
+        check_unsupported(preboot_request(VmmAction::SubmitLlmResponse(
+            SubmitLlmResponseConfig {
+                request_id: "req-1".to_string(),
+                vsock_port: 1234,
+                response: "ok".to_string(),
+                resume_vm: None,
+            },
+        )));
     }
 
     fn runtime_request(request: VmmAction) -> Result<VmmData, VmmActionError> {
@@ -1350,5 +1368,21 @@ mod tests {
 
         let res = runtime_request(VmmAction::ExitLlmWait);
         assert_eq!(res.unwrap(), VmmData::Empty);
+    }
+
+    #[test]
+    fn test_runtime_submit_llm_response_without_vsock() {
+        let res = runtime_request(VmmAction::SubmitLlmResponse(SubmitLlmResponseConfig {
+            request_id: "req-1".to_string(),
+            vsock_port: 11000,
+            response: "result".to_string(),
+            resume_vm: Some(false),
+        }));
+        assert!(matches!(
+            res,
+            Err(VmmActionError::InternalVmm(
+                VmmError::AgentRuntimeVsockNotConfigured
+            ))
+        ));
     }
 }

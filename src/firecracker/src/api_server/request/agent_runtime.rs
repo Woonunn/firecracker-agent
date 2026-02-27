@@ -4,7 +4,9 @@
 use micro_http::Body;
 use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
-use vmm::vmm_config::agent_runtime::{AgentRuntimeConfig, AgentRuntimeState};
+use vmm::vmm_config::agent_runtime::{
+    AgentRuntimeConfig, AgentRuntimeState, SubmitLlmResponseConfig,
+};
 
 use crate::api_server::parsed_request::{ParsedRequest, RequestError};
 
@@ -35,9 +37,16 @@ pub(crate) fn parse_patch_agent_runtime(body: &Body) -> Result<ParsedRequest, Re
     Ok(parsed_req)
 }
 
+pub(crate) fn parse_put_agent_runtime_response(
+    body: &Body,
+) -> Result<ParsedRequest, RequestError> {
+    let cfg = serde_json::from_slice::<SubmitLlmResponseConfig>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::SubmitLlmResponse(cfg)))
+}
+
 #[cfg(test)]
 mod tests {
-    use vmm::vmm_config::agent_runtime::EnterLlmWaitConfig;
+    use vmm::vmm_config::agent_runtime::{EnterLlmWaitConfig, SubmitLlmResponseConfig};
 
     use super::*;
     use crate::api_server::parsed_request::tests::{depr_action_from_req, vmm_action_from_request};
@@ -127,6 +136,42 @@ mod tests {
         }"#;
         assert!(matches!(
             parse_patch_agent_runtime(&Body::new(body)),
+            Err(RequestError::SerdeJson(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_put_agent_runtime_response() {
+        let body = r#"{
+            "request_id": "req-1",
+            "vsock_port": 11000,
+            "response": "{\"ok\":true}",
+            "resume_vm": true
+        }"#;
+        assert_eq!(
+            vmm_action_from_request(parse_put_agent_runtime_response(&Body::new(body)).unwrap()),
+            VmmAction::SubmitLlmResponse(SubmitLlmResponseConfig {
+                request_id: "req-1".to_string(),
+                vsock_port: 11000,
+                response: "{\"ok\":true}".to_string(),
+                resume_vm: Some(true),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_put_agent_runtime_response_bad_request_body() {
+        assert!(matches!(
+            parse_put_agent_runtime_response(&Body::new("invalid_payload")),
+            Err(RequestError::SerdeJson(_))
+        ));
+
+        let body = r#"{
+            "request_id": "req-1",
+            "response": "payload"
+        }"#;
+        assert!(matches!(
+            parse_put_agent_runtime_response(&Body::new(body)),
             Err(RequestError::SerdeJson(_))
         ));
     }

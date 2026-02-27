@@ -118,7 +118,9 @@ pub mod initrd;
 
 use std::collections::HashMap;
 use std::io;
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
@@ -161,7 +163,7 @@ use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
-use crate::vmm_config::agent_runtime::EnterLlmWaitConfig;
+use crate::vmm_config::agent_runtime::{EnterLlmWaitConfig, SubmitLlmResponseConfig};
 use crate::vmm_config::vsock::VsockDeviceConfig;
 use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
 use crate::vstate::vcpu::VcpuState;
@@ -278,6 +280,14 @@ pub enum VmmError {
     AgentRuntimeUnsupportedAdvice,
     /// Agent runtime madvise call failed: {0}
     AgentRuntimeMadvise(io::Error),
+    /// Agent runtime requires a configured vsock device.
+    AgentRuntimeVsockNotConfigured,
+    /// Failed to connect to agent runtime vsock endpoint {0}: {1}
+    AgentRuntimeVsockConnect(String, io::Error),
+    /// Failed to write agent runtime response to vsock endpoint {0}: {1}
+    AgentRuntimeVsockWrite(String, io::Error),
+    /// Failed to serialize agent runtime response payload: {0}
+    AgentRuntimeResponseSerialize(serde_json::Error),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -303,6 +313,15 @@ fn process_rss_kib() -> Option<u64> {
         let value = line.strip_prefix("VmRSS:")?;
         value.split_whitespace().next()?.parse::<u64>().ok()
     })
+}
+
+fn llm_response_payload(request_id: &str, response: &str) -> Result<Vec<u8>, serde_json::Error> {
+    let mut payload = serde_json::to_vec(&serde_json::json!({
+        "request_id": request_id,
+        "response": response,
+    }))?;
+    payload.push(b'\n');
+    Ok(payload)
 }
 
 // Error type for [`Vmm::emulate_serial_init`].
@@ -649,6 +668,32 @@ impl Vmm {
         self.paused_by_llm_wait = false;
         info!("MicroVM exited LLM wait mode.");
         Ok(())
+    }
+
+    /// Submits an LLM response payload and optionally resumes the VM first.
+    pub fn submit_llm_response(&mut self, config: SubmitLlmResponseConfig) -> Result<(), VmmError> {
+        if config.resume_vm.unwrap_or(true) {
+            self.exit_llm_wait()?;
+        }
+
+        let endpoint = self.agent_runtime_vsock_endpoint(config.vsock_port)?;
+        let payload = llm_response_payload(&config.request_id, &config.response)
+            .map_err(VmmError::AgentRuntimeResponseSerialize)?;
+        let mut stream = UnixStream::connect(endpoint.as_str())
+            .map_err(|err| VmmError::AgentRuntimeVsockConnect(endpoint.clone(), err))?;
+        stream
+            .write_all(&payload)
+            .map_err(|err| VmmError::AgentRuntimeVsockWrite(endpoint, err))?;
+        Ok(())
+    }
+
+    fn agent_runtime_vsock_endpoint(&self, port: u32) -> Result<String, VmmError> {
+        let vsock_path = self
+            .full_config()
+            .vsock
+            .ok_or(VmmError::AgentRuntimeVsockNotConfigured)?
+            .uds_path;
+        Ok(format!("{}_{}", vsock_path, port))
     }
 
     fn reclaim_guest_memory_with_madvise(&self) -> Result<(), VmmError> {
@@ -1036,6 +1081,16 @@ mod tests {
         assert!(host_has_swap_enabled_from_contents(
             "Filename\tType\tSize\tUsed\tPriority\n/dev/zram0\tpartition\t102396\t0\t100\n"
         ));
+    }
+
+    #[test]
+    fn test_llm_response_payload_format() {
+        let payload = llm_response_payload("req-1", "{\"ok\":true}").unwrap();
+        assert_eq!(payload.last(), Some(&b'\n'));
+        let body = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["request_id"], "req-1");
+        assert_eq!(json["response"], "{\"ok\":true}");
     }
 
     #[test]

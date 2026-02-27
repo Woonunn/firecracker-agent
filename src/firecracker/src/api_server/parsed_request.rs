@@ -11,7 +11,7 @@ use vmm::rpc_interface::{VmmAction, VmmActionError, VmmData};
 
 use super::ApiServer;
 use super::request::actions::parse_put_actions;
-use super::request::agent_runtime::parse_patch_agent_runtime;
+use super::request::agent_runtime::{parse_patch_agent_runtime, parse_put_agent_runtime_response};
 use super::request::balloon::{parse_get_balloon, parse_patch_balloon, parse_put_balloon};
 use super::request::boot_source::parse_put_boot_source;
 use super::request::cpu_configuration::parse_put_cpu_config;
@@ -110,6 +110,13 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "snapshot", Some(body)) => parse_put_snapshot(body, path_tokens.next()),
             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
             (Method::Put, "entropy", Some(body)) => parse_put_entropy(body),
+            (Method::Put, "agent", Some(body))
+                if path_tokens.next() == Some("runtime")
+                    && path_tokens.next() == Some("response")
+                    && path_tokens.next().is_none() =>
+            {
+                parse_put_agent_runtime_response(body)
+            }
             (Method::Put, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {
                 parse_put_memory_hotplug(body)
             }
@@ -121,7 +128,9 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Patch, "network-interfaces", Some(body)) => {
                 parse_patch_net(body, path_tokens.next())
             }
-            (Method::Patch, "agent", Some(body)) if path_tokens.next() == Some("runtime") => {
+            (Method::Patch, "agent", Some(body))
+                if path_tokens.next() == Some("runtime") && path_tokens.next().is_none() =>
+            {
                 parse_patch_agent_runtime(body)
             }
             (Method::Patch, "vm", Some(body)) => parse_patch_vm_state(body),
@@ -346,7 +355,7 @@ pub mod tests {
     use vmm::builder::StartMicrovmError;
     use vmm::cpu_config::templates::test_utils::build_test_template;
     use vmm::devices::virtio::balloon::device::HintingStatus;
-    use vmm::vmm_config::agent_runtime::EnterLlmWaitConfig;
+    use vmm::vmm_config::agent_runtime::{EnterLlmWaitConfig, SubmitLlmResponseConfig};
     use vmm::resources::VmmConfig;
     use vmm::rpc_interface::VmmActionError;
     use vmm::vmm_config::balloon::{BalloonDeviceConfig, BalloonStats};
@@ -1086,6 +1095,34 @@ pub mod tests {
             ParsedRequest::try_from(&req),
             Err(RequestError::SerdeJson(_))
         ));
+    }
+
+    #[test]
+    fn test_try_from_put_agent_runtime_response() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+
+        let body = r#"{
+            "request_id": "req-1",
+            "vsock_port": 11000,
+            "response": "{\"ok\":true}",
+            "resume_vm": true
+        }"#;
+        sender
+            .write_all(http_request("PUT", "/agent/runtime/response", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed),
+            VmmAction::SubmitLlmResponse(SubmitLlmResponseConfig {
+                request_id: "req-1".to_string(),
+                vsock_port: 11000,
+                response: "{\"ok\":true}".to_string(),
+                resume_vm: Some(true),
+            })
+        );
     }
 
     #[test]

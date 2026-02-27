@@ -21,6 +21,24 @@ Request body:
 - `target_balloon_mib` (deprecated): accepted for compatibility, ignored.
 - `acknowledge_on_stop` (deprecated): accepted for compatibility, ignored.
 
+`PUT /agent/runtime/response`
+
+Request body:
+
+```json
+{
+  "request_id": "req-1",
+  "vsock_port": 11000,
+  "response": "{\"ok\":true}",
+  "resume_vm": true
+}
+```
+
+- `request_id`: caller correlation id.
+- `vsock_port`: guest vsock listening port for response delivery.
+- `response`: serialized response payload.
+- `resume_vm` (optional, default `true`): if set, leave `LlmWaiting` before delivery.
+
 ## Runtime behavior
 
 ### Enter `LlmWaiting`
@@ -37,6 +55,15 @@ Request body:
 2. Clear LLM wait mode state.
 
 Both transitions are idempotent.
+
+### Host-submitted response handoff
+
+1. Host-side proxy receives external LLM/network response.
+2. Proxy calls `PUT /agent/runtime/response`.
+3. Firecracker optionally resumes the VM, then forwards:
+   - `{"request_id":"...","response":"..."}` plus trailing newline
+   - to host vsock socket path `<uds_path>_<vsock_port>`.
+4. Guest service reads payload on the requested vsock port and continues execution.
 
 ## Operational notes
 
