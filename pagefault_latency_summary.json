@@ -1,0 +1,44 @@
+{
+  "no_pageout_samples": "test_results/test_agent_runtime_pageout_sandbox_latency/test_agent_runtime_pageout_sandbox_latency[PCI_ON-no_pageout-vmlinux-6.1.172]/no_pageout_samples.json",
+  "pageout_samples": "test_results/test_agent_runtime_pageout_sandbox_latency/test_agent_runtime_pageout_sandbox_latency[PCI_ON-pageout-vmlinux-6.1.172]/pageout_samples.json",
+  "touch_delta_ms": [
+    9.529376000000001,
+    9.775079000000002,
+    18.570984,
+    9.518454,
+    15.128043,
+    10.023482000000001,
+    18.456277999999998,
+    9.193801,
+    18.526497,
+    9.432749000000001
+  ],
+  "entry_delta_ms": [
+    2.2778860000000023,
+    1.9964450000000014,
+    22.459477999999997,
+    5.927765999999998,
+    11.391827999999997,
+    9.724594,
+    12.810794000000001,
+    3.331671,
+    15.450492,
+    2.825931999999998
+  ],
+  "pageout_rss_reclaimed_mib": [
+    70.16015625,
+    25.60546875,
+    2.9140625,
+    4.74609375,
+    1.73828125,
+    0.16796875,
+    0.54296875,
+    0.08984375,
+    0.50390625,
+    0.6015625
+  ],
+  "mean_touch_delta_ms": 12.8154743,
+  "median_touch_delta_ms": 9.899280500000001,
+  "min_touch_delta_ms": 9.193801,
+  "max_touch_delta_ms": 18.570984
+}
