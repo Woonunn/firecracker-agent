@@ -43,6 +43,98 @@ DEFAULT_LATENCY_SLO_MS = 10_000.0
 DEFAULT_FAILURE_THRESHOLD = 0.0
 DEFAULT_THROUGHPUT_REGRESSION_THRESHOLD = 0.10
 DEFAULT_RSS_SAMPLE_INTERVAL_SEC = 1.0
+DEFAULT_WORKING_SET_MIB = 256
+
+AGENT_MEMORY_WORKER_PATH = "/tmp/agent_memory_worker.py"
+AGENT_MEMORY_WORKER_READY = "/tmp/agent_memory_worker.ready"
+AGENT_MEMORY_WORKER_OUT = "/tmp/agent_memory_worker.out"
+AGENT_MEMORY_WORKER_LOG = "/tmp/agent_memory_worker.log"
+
+AGENT_MEMORY_WORKER_SCRIPT = r"""#!/usr/bin/env python3
+import argparse
+import hashlib
+import mmap
+import os
+import signal
+import struct
+import time
+
+PAGE_SIZE = 4096
+CHUNK_SIZE = 1024 * 1024
+NANOS_PER_SEC = 1000000000
+READY_PATH = "/tmp/agent_memory_worker.ready"
+OUT_PATH = "/tmp/agent_memory_worker.out"
+
+touch_requested = False
+
+
+def monotonic_ns():
+    sec = time.clock_gettime(time.CLOCK_MONOTONIC)
+    return int(sec * NANOS_PER_SEC)
+
+
+def request_touch(signum, frame):
+    global touch_requested
+    touch_requested = True
+
+
+def fill_unique(buf, agent_id):
+    size = len(buf)
+    for offset in range(0, size, CHUNK_SIZE):
+        end = min(offset + CHUNK_SIZE, size)
+        seed = struct.pack("<QQQ", agent_id, 0, offset // CHUNK_SIZE)
+        buf[offset:end] = hashlib.shake_128(seed).digest(end - offset)
+
+
+def stamp_pages(buf, agent_id, generation):
+    start = monotonic_ns()
+    size = len(buf)
+    for page_index, offset in enumerate(range(0, size, PAGE_SIZE)):
+        stamp = struct.pack("<QQ", agent_id ^ generation, page_index)
+        buf[offset : offset + len(stamp)] = stamp
+    return monotonic_ns() - start
+
+
+def write_atomic(path, contents):
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as file:
+        file.write(contents)
+    os.replace(tmp_path, path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--agent-id", type=int, required=True)
+    parser.add_argument("--size-mib", type=int, required=True)
+    args = parser.parse_args()
+
+    size = args.size_mib * 1024 * 1024
+    buf = mmap.mmap(-1, size, access=mmap.ACCESS_WRITE)
+
+    init_start = monotonic_ns()
+    fill_unique(buf, args.agent_id)
+    init_ns = monotonic_ns() - init_start
+    write_atomic(
+        READY_PATH,
+        f"pid={os.getpid()}\nagent_id={args.agent_id}\n"
+        f"size_mib={args.size_mib}\ninitial_fill_ns={init_ns}\n",
+    )
+
+    signal.signal(signal.SIGUSR1, request_touch)
+    generation = 0
+    while True:
+        signal.pause()
+        if not touch_requested:
+            continue
+        touch_requested = False
+        generation += 1
+        duration_ns = stamp_pages(buf, args.agent_id, generation)
+        write_atomic(OUT_PATH, f"{duration_ns}\n")
+
+
+if __name__ == "__main__":
+    main()
+"""
 
 FAILURE_KINDS = (
     "vm_start_failure",
@@ -65,7 +157,9 @@ REQUIRED_CONCURRENCY_RESULT_FIELDS = {
     "resume_latency_ms",
     "running_phase_latency_ms",
     "aggregate_rss_kib",
+    "aggregate_smaps_rollup_kib",
     "memory_efficiency_jobs_per_sec_per_gib_host_rss",
+    "memory_efficiency_jobs_per_sec_per_gib_host_pss",
     "failure_counts",
     "failure_rate",
     "usable",
@@ -91,6 +185,7 @@ class ThroughputConfig:
     comparison_summary_file: Path | None
     pool_dir: Path | None
     rss_sample_interval_sec: float
+    working_set_mib: int
 
     @property
     def max_concurrency(self):
@@ -188,22 +283,49 @@ def _rss_kib(microvm):
     return get_resident_memory(microvm.ps)
 
 
+def _smaps_rollup_kib(microvm):
+    values = {}
+    smaps_path = Path(f"/proc/{microvm.ps.pid}/smaps_rollup")
+    for line in smaps_path.read_text(encoding="utf-8").splitlines():
+        if ":" not in line:
+            continue
+        key, rest = line.split(":", 1)
+        parts = rest.strip().split()
+        if len(parts) >= 2 and parts[1] == "kB":
+            values[key] = int(parts[0])
+    return {
+        "smaps_rss_kib": values.get("Rss", 0),
+        "pss_kib": values.get("Pss", 0),
+        "private_clean_kib": values.get("Private_Clean", 0),
+        "private_dirty_kib": values.get("Private_Dirty", 0),
+        "shared_clean_kib": values.get("Shared_Clean", 0),
+        "shared_dirty_kib": values.get("Shared_Dirty", 0),
+        "anonymous_kib": values.get("Anonymous", 0),
+        "swap_kib": values.get("Swap", 0),
+        "swap_pss_kib": values.get("SwapPss", 0),
+    }
+
+
 def _aggregate_rss_sample(microvms):
     rss_kib = 0
+    smaps_totals = Counter()
     live_vms = 0
     for microvm in microvms:
         try:
             rss_kib += _rss_kib(microvm)
+            smaps_totals.update(_smaps_rollup_kib(microvm))
             live_vms += 1
         except Exception:  # best-effort sampler; failures are recorded elsewhere
             continue
     if live_vms == 0:
         return None
-    return {
+    sample = {
         "timestamp_monotonic_sec": time.monotonic(),
         "rss_kib": rss_kib,
         "live_vms": live_vms,
     }
+    sample.update(smaps_totals)
+    return sample
 
 
 def _process_cpu_time_sec(microvm):
@@ -309,6 +431,21 @@ def _parse_config():
     if not 0 <= failure_threshold <= 1:
         raise ValueError("AGENT_THROUGHPUT_FAILURE_THRESHOLD must be between 0 and 1")
 
+    guest_mem_mib = _env_int(
+        "AGENT_THROUGHPUT_GUEST_MEM_MIB", DEFAULT_GUEST_MEM_MIB
+    )
+    working_set_mib = _env_int(
+        "AGENT_THROUGHPUT_WORKING_SET_MIB",
+        DEFAULT_WORKING_SET_MIB,
+    )
+    if working_set_mib <= 0:
+        raise ValueError("AGENT_THROUGHPUT_WORKING_SET_MIB must be positive")
+    if working_set_mib >= guest_mem_mib:
+        raise ValueError(
+            "AGENT_THROUGHPUT_WORKING_SET_MIB must be smaller than "
+            "AGENT_THROUGHPUT_GUEST_MEM_MIB"
+        )
+
     return ThroughputConfig(
         mode=mode,
         seed=_env_int("AGENT_THROUGHPUT_SEED", DEFAULT_SEED),
@@ -320,9 +457,7 @@ def _parse_config():
         run_target_sec=_env_float(
             "AGENT_THROUGHPUT_RUN_TARGET_SEC", DEFAULT_RUN_TARGET_SEC
         ),
-        guest_mem_mib=_env_int(
-            "AGENT_THROUGHPUT_GUEST_MEM_MIB", DEFAULT_GUEST_MEM_MIB
-        ),
+        guest_mem_mib=guest_mem_mib,
         job_timeout_sec=_env_float(
             "AGENT_THROUGHPUT_JOB_TIMEOUT_SEC", DEFAULT_JOB_TIMEOUT_SEC
         ),
@@ -341,6 +476,7 @@ def _parse_config():
             "AGENT_THROUGHPUT_RSS_SAMPLE_INTERVAL_SEC",
             DEFAULT_RSS_SAMPLE_INTERVAL_SEC,
         ),
+        working_set_mib=working_set_mib,
     )
 
 
@@ -531,32 +667,54 @@ def _throughput_ssh(microvm):
     return ssh
 
 
-def _start_fast_page_fault_helper(microvm, timeout_sec):
-    ssh = _throughput_ssh(microvm)
+def _install_memory_worker(ssh, timeout_sec):
     ssh.check_output(
-        "rm -f /tmp/fast_page_fault_helper.out; "
-        "nohup /usr/local/bin/fast_page_fault_helper >/dev/null 2>&1 </dev/null &",
+        f"cat > {AGENT_MEMORY_WORKER_PATH} <<'AGENT_MEMORY_WORKER'\n"
+        f"{AGENT_MEMORY_WORKER_SCRIPT}\n"
+        "AGENT_MEMORY_WORKER\n"
+        f"chmod +x {AGENT_MEMORY_WORKER_PATH}",
+        timeout=timeout_sec,
+    )
+
+
+def _start_agent_memory_worker(microvm, agent_index, working_set_mib, timeout_sec):
+    ssh = _throughput_ssh(microvm)
+    _install_memory_worker(ssh, timeout_sec)
+    ssh.check_output(
+        f"rm -f {AGENT_MEMORY_WORKER_READY} {AGENT_MEMORY_WORKER_OUT} "
+        f"{AGENT_MEMORY_WORKER_LOG}; "
+        f"nohup python3 {AGENT_MEMORY_WORKER_PATH} "
+        f"--agent-id {agent_index} --size-mib {working_set_mib} "
+        f"> {AGENT_MEMORY_WORKER_LOG} 2>&1 </dev/null &",
         timeout=timeout_sec,
     )
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
-        result = ssh.run("pidof fast_page_fault_helper", timeout=timeout_sec)
+        result = ssh.run(
+            f"test -s {AGENT_MEMORY_WORKER_READY} && "
+            f"awk -F= '/^pid=/ {{print $2}}' {AGENT_MEMORY_WORKER_READY}",
+            timeout=timeout_sec,
+        )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().split()[0]
+            return result.stdout.strip()
         time.sleep(0.05)
-    raise TimeoutError("Timed out waiting for fast_page_fault_helper to start")
+    log = ssh.run(
+        f"cat {AGENT_MEMORY_WORKER_LOG} 2>/dev/null || true",
+        timeout=timeout_sec,
+    ).stdout.strip()
+    raise TimeoutError(f"Timed out waiting for agent memory worker to start: {log}")
 
 
-def _trigger_sandbox_memory_touch(microvm, pid, timeout_sec):
+def _trigger_agent_memory_touch(microvm, pid, timeout_sec):
     ssh = _throughput_ssh(microvm)
-    ssh.check_output("rm -f /tmp/fast_page_fault_helper.out", timeout=timeout_sec)
+    ssh.check_output(f"rm -f {AGENT_MEMORY_WORKER_OUT}", timeout=timeout_sec)
     start_ns = time.perf_counter_ns()
     ssh.check_output(f"kill -s SIGUSR1 {pid}", timeout=timeout_sec)
     duration_ns = int(
         ssh.check_output(
-            "while ! grep -Eq '^[0-9]+$' /tmp/fast_page_fault_helper.out 2>/dev/null; "
+            f"while ! grep -Eq '^[0-9]+$' {AGENT_MEMORY_WORKER_OUT} 2>/dev/null; "
             "do sleep 0.01; done; "
-            "cat /tmp/fast_page_fault_helper.out",
+            f"cat {AGENT_MEMORY_WORKER_OUT}",
             timeout=timeout_sec,
         ).stdout.strip()
     )
@@ -584,19 +742,16 @@ def _run_one_agent(microvm, mode, schedule, window_start, deadline, job_timeout_
             break
 
         job_start_ns = time.perf_counter_ns()
-        pid = None
         try:
-            helper_start_ns = time.perf_counter_ns()
-            pid = _start_fast_page_fault_helper(microvm, job_timeout_sec)
-            helper_start_ms = (time.perf_counter_ns() - helper_start_ns) / NS_IN_MSEC
-
             wait_entry_latency_ms = _enter_wait(microvm, mode)
             time.sleep(wait_sec)
             resume_latency_ms = _exit_wait(microvm, mode)
 
             run_start_ns = time.perf_counter_ns()
-            sandbox_touch_ms, sandbox_total_ms = _trigger_sandbox_memory_touch(
-                microvm, pid, job_timeout_sec
+            memory_touch_ms, memory_touch_total_ms = _trigger_agent_memory_touch(
+                microvm,
+                microvm._agent_throughput_memory_worker_pid,
+                job_timeout_sec,
             )
             running_phase_ms = (time.perf_counter_ns() - run_start_ns) / NS_IN_MSEC
 
@@ -613,12 +768,11 @@ def _run_one_agent(microvm, mode, schedule, window_start, deadline, job_timeout_
                         "cycle_index": cycle_index,
                         "wait_sec": wait_sec,
                         "run_target_sec": run_target_sec,
-                        "helper_start_latency_ms": helper_start_ms,
                         "wait_entry_latency_ms": wait_entry_latency_ms,
                         "resume_latency_ms": resume_latency_ms,
                         "running_phase_latency_ms": running_phase_ms,
-                        "sandbox_touch_latency_ms": sandbox_touch_ms,
-                        "sandbox_total_latency_ms": sandbox_total_ms,
+                        "memory_touch_latency_ms": memory_touch_ms,
+                        "memory_touch_total_latency_ms": memory_touch_total_ms,
                         "job_latency_ms": job_latency_ms,
                     }
                 )
@@ -640,14 +794,12 @@ def _run_one_agent(microvm, mode, schedule, window_start, deadline, job_timeout_
                     pass
             try:
                 _throughput_ssh(microvm).run(
-                    "pkill -9 fast_page_fault_helper 2>/dev/null || true",
+                    "pkill -9 -f agent_memory_worker.py 2>/dev/null || true",
                     timeout=job_timeout_sec,
                 )
             except Exception:
                 pass
             break
-        finally:
-            pid = None
 
     return {
         "samples": samples,
@@ -689,6 +841,12 @@ def _build_microvms(microvm_factory, guest_kernel, rootfs, pci_enabled, count, c
             vm.add_net_iface()
             vm.start()
             vm._agent_throughput_ssh = vm.ssh
+            vm._agent_throughput_memory_worker_pid = _start_agent_memory_worker(
+                vm,
+                vm_index,
+                config.working_set_mib,
+                config.job_timeout_sec,
+            )
             microvms.append(vm)
         except Exception as exc:
             failure_counts["vm_start_failure"] += 1
@@ -836,13 +994,37 @@ def _build_concurrency_result(
         "mean_kib": statistics.mean(rss_values) if rss_values else 0,
         "samples": rss_samples,
     }
+    smaps_fields = (
+        "smaps_rss_kib",
+        "pss_kib",
+        "private_clean_kib",
+        "private_dirty_kib",
+        "shared_clean_kib",
+        "shared_dirty_kib",
+        "anonymous_kib",
+        "swap_kib",
+        "swap_pss_kib",
+    )
+    aggregate_smaps = {"sample_count": len(rss_samples)}
+    for field in smaps_fields:
+        values = [sample.get(field, 0) for sample in rss_samples]
+        aggregate_smaps[field] = {
+            "min_kib": min(values, default=0),
+            "max_kib": max(values, default=0),
+            "mean_kib": statistics.mean(values) if values else 0,
+        }
+
     rss_gib = aggregate_rss["max_kib"] / (1024 * 1024)
-    memory_efficiency = throughput / rss_gib if rss_gib > 0 else 0.0
+    pss_gib = aggregate_smaps["pss_kib"]["max_kib"] / (1024 * 1024)
+    rss_memory_efficiency = throughput / rss_gib if rss_gib > 0 else 0.0
+    pss_memory_efficiency = throughput / pss_gib if pss_gib > 0 else 0.0
 
     result = {
         "mode": config.mode,
         "concurrency": concurrency,
         "duration_sec": config.duration_sec,
+        "guest_mem_mib": config.guest_mem_mib,
+        "working_set_mib": config.working_set_mib,
         "setup_duration_sec": setup_duration_sec,
         "completed_jobs": completed_jobs,
         "completed_jobs_per_sec": throughput,
@@ -859,11 +1041,16 @@ def _build_concurrency_result(
         "running_phase_latency_ms": _latency_summary(
             [sample["running_phase_latency_ms"] for sample in samples]
         ),
-        "sandbox_touch_latency_ms": _latency_summary(
-            [sample["sandbox_touch_latency_ms"] for sample in samples]
+        "memory_touch_latency_ms": _latency_summary(
+            [sample["memory_touch_latency_ms"] for sample in samples]
+        ),
+        "memory_touch_total_latency_ms": _latency_summary(
+            [sample["memory_touch_total_latency_ms"] for sample in samples]
         ),
         "aggregate_rss_kib": aggregate_rss,
-        "memory_efficiency_jobs_per_sec_per_gib_host_rss": memory_efficiency,
+        "aggregate_smaps_rollup_kib": aggregate_smaps,
+        "memory_efficiency_jobs_per_sec_per_gib_host_rss": rss_memory_efficiency,
+        "memory_efficiency_jobs_per_sec_per_gib_host_pss": pss_memory_efficiency,
         "failure_counts": failure_counts,
         "failure_rate": failure_rate,
         "failure_details": failure_details,
@@ -969,6 +1156,13 @@ def _summarize_results(config, sequence_path, results, comparison_summary=None):
         "memory_efficiency_jobs_per_sec_per_gib_host_rss": (
             max_throughput_result[
                 "memory_efficiency_jobs_per_sec_per_gib_host_rss"
+            ]
+            if max_throughput_result
+            else 0.0
+        ),
+        "memory_efficiency_jobs_per_sec_per_gib_host_pss": (
+            max_throughput_result[
+                "memory_efficiency_jobs_per_sec_per_gib_host_pss"
             ]
             if max_throughput_result
             else 0.0
@@ -1117,7 +1311,7 @@ class _RecordingSsh:
 
     def check_output(self, command, timeout=None):
         self.commands.append((command, timeout))
-        if "cat /tmp/fast_page_fault_helper.out" in command:
+        if f"cat {AGENT_MEMORY_WORKER_OUT}" in command:
             return _FakeSshResult("2000000\n")
         return _FakeSshResult("")
 
@@ -1143,17 +1337,17 @@ def test_agent_throughput_agent_mode_calls_agent_runtime():
     ]
 
 
-def test_agent_throughput_memory_touch_waits_for_numeric_helper_output():
+def test_agent_throughput_memory_touch_waits_for_numeric_worker_output():
     vm = _MemoryTouchVm()
 
-    sandbox_touch_ms, sandbox_total_ms = _trigger_sandbox_memory_touch(
+    memory_touch_ms, memory_touch_total_ms = _trigger_agent_memory_touch(
         vm, "123", timeout_sec=1.0
     )
 
     wait_command = vm.ssh.commands[-1][0]
-    assert "grep -Eq '^[0-9]+$' /tmp/fast_page_fault_helper.out" in wait_command
-    assert sandbox_touch_ms == 2.0
-    assert sandbox_total_ms >= 0.0
+    assert f"grep -Eq '^[0-9]+$' {AGENT_MEMORY_WORKER_OUT}" in wait_command
+    assert memory_touch_ms == 2.0
+    assert memory_touch_total_ms >= 0.0
 
 
 def test_agent_throughput_agent_mode_skips_without_swap(monkeypatch):
@@ -1197,6 +1391,7 @@ def test_agent_throughput_result_schema_contains_required_fields():
         comparison_summary_file=None,
         pool_dir=None,
         rss_sample_interval_sec=1.0,
+        working_set_mib=64,
     )
     result = _build_concurrency_result(
         config=config,
@@ -1208,10 +1403,21 @@ def test_agent_throughput_result_schema_contains_required_fields():
                 "wait_entry_latency_ms": 0.0,
                 "resume_latency_ms": 0.0,
                 "running_phase_latency_ms": 25.0,
-                "sandbox_touch_latency_ms": 20.0,
+                "memory_touch_latency_ms": 20.0,
+                "memory_touch_total_latency_ms": 22.0,
             }
         ],
-        rss_samples=[{"timestamp_monotonic_sec": 1.0, "rss_kib": 1024, "live_vms": 2}],
+        rss_samples=[
+            {
+                "timestamp_monotonic_sec": 1.0,
+                "rss_kib": 1024,
+                "live_vms": 2,
+                "smaps_rss_kib": 1024,
+                "pss_kib": 900,
+                "private_dirty_kib": 800,
+                "anonymous_kib": 700,
+            }
+        ],
         cpu_utilization=_build_cpu_utilization(
             cpu_start_sec=1.0,
             cpu_end_sec=1.5,
@@ -1225,6 +1431,7 @@ def test_agent_throughput_result_schema_contains_required_fields():
     _assert_concurrency_result_schema(result)
     assert result["completed_jobs_per_sec"] == 1.0
     assert result["aggregate_rss_kib"]["max_kib"] == 1024
+    assert result["aggregate_smaps_rollup_kib"]["pss_kib"]["max_kib"] == 900
     assert result["aggregate_cpu_utilization"]["average_one_cpu_percent"] == 50.0
 
 
@@ -1245,6 +1452,7 @@ def test_agent_throughput_zero_completed_jobs_is_not_usable():
         comparison_summary_file=None,
         pool_dir=None,
         rss_sample_interval_sec=1.0,
+        working_set_mib=256,
     )
     result = _build_concurrency_result(
         config=config,
