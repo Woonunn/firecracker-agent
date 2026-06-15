@@ -24,7 +24,7 @@ use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::HotplugDeviceConfig;
-use crate::vmm_config::agent_runtime::EnterLlmWaitConfig;
+use crate::vmm_config::agent_runtime::{EnterLlmWaitConfig, SubmitLlmResponseConfig};
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -516,6 +516,7 @@ impl<'a> PrebootApiController<'a> {
             | UpdateBalloon(_)
             | UpdateBalloonStatistics(_)
             | UpdateBlockDevice(_)
+            | HotUnplugDevice(_)
             | UpdateMemoryHotplugSize(_)
             | UpdateNetworkInterface(_)
             | UpdatePmemDevice(_)
@@ -1386,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_agent_runtime_without_swap() {
+    fn test_runtime_agent_runtime_without_swap_gate() {
         let enter_res = runtime_request(VmmAction::EnterLlmWait(EnterLlmWaitConfig {
             pause_on_wait: Some(true),
         }));
@@ -1394,10 +1395,7 @@ mod tests {
             assert!(matches!(
                 err,
                 VmmActionError::InternalVmm(
-                    VmmError::AgentRuntimeSwapNotAvailable
-                        | VmmError::AgentRuntimeSwapCheck(_)
-                        | VmmError::AgentRuntimeUnsupportedAdvice
-                        | VmmError::AgentRuntimeMadvise(_)
+                    VmmError::AgentRuntimeUnsupportedAdvice | VmmError::AgentRuntimeMadvise(_)
                 )
             ));
         }

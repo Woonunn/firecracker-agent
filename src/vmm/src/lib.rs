@@ -121,8 +121,7 @@ use std::io;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use device_manager::DeviceManager;
@@ -160,12 +159,14 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
-use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::agent_runtime::{EnterLlmWaitConfig, SubmitLlmResponseConfig};
+use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
+use crate::vstate::memory::{
+    GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress,
+};
 #[cfg(target_arch = "aarch64")]
-use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::{StartVcpusError, Vm};
@@ -274,10 +275,6 @@ pub enum VmmError {
     Balloon(#[from] BalloonError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
-    /// Agent runtime requires host swap to be enabled.
-    AgentRuntimeSwapNotAvailable,
-    /// Failed to inspect host swap configuration: {0}
-    AgentRuntimeSwapCheck(io::Error),
     /// Agent runtime madvise with MADV_PAGEOUT is not supported on this host kernel.
     AgentRuntimeUnsupportedAdvice,
     /// Agent runtime madvise call failed: {0}
@@ -298,15 +295,6 @@ pub type DirtyBitmap = HashMap<u32, Vec<u64>>;
 /// Returns the size of guest memory, in MiB.
 pub(crate) fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
     guest_memory.iter().map(|region| region.len()).sum::<u64>() >> 20
-}
-
-fn host_has_swap_enabled() -> Result<bool, io::Error> {
-    let swaps = std::fs::read_to_string("/proc/swaps")?;
-    Ok(host_has_swap_enabled_from_contents(&swaps))
-}
-
-fn host_has_swap_enabled_from_contents(swaps: &str) -> bool {
-    swaps.lines().skip(1).any(|line| !line.trim().is_empty())
 }
 
 fn process_rss_kib() -> Option<u64> {
@@ -330,15 +318,6 @@ fn llm_response_payload(request_id: &str, response: &str) -> Result<Vec<u8>, ser
 /// Emulate serial init error: {0}
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub struct EmulateSerialInitError(#[from] std::io::Error);
-
-/// Error type for [`Vmm::start_vcpus`].
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum StartVcpusError {
-    /// VMM observer init error: {0}
-    VmmObserverInit(#[from] vmm_sys_util::errno::Error),
-    /// Vcpu handle error: {0}
-    VcpuHandle(#[from] StartThreadedError),
-}
 
 /// Error type for [`Vmm::dump_cpu_config()`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -547,22 +526,13 @@ impl Vmm {
 
     /// Transitions the microVM into an LLM wait mode.
     pub fn enter_llm_wait(&mut self, config: EnterLlmWaitConfig) -> Result<(), VmmError> {
-        let has_swap = host_has_swap_enabled().map_err(VmmError::AgentRuntimeSwapCheck)?;
-        self.enter_llm_wait_with_swap(config, has_swap)
+        self.enter_llm_wait_inner(config)
     }
 
-    fn enter_llm_wait_with_swap(
-        &mut self,
-        config: EnterLlmWaitConfig,
-        has_swap: bool,
-    ) -> Result<(), VmmError> {
+    fn enter_llm_wait_inner(&mut self, config: EnterLlmWaitConfig) -> Result<(), VmmError> {
         if self.in_llm_wait {
             info!("Ignoring duplicate EnterLlmWait request.");
             return Ok(());
-        }
-
-        if !has_swap {
-            return Err(VmmError::AgentRuntimeSwapNotAvailable);
         }
 
         self.paused_by_llm_wait = false;
@@ -647,7 +617,11 @@ impl Vmm {
     }
 
     fn reclaim_guest_memory_with_madvise(&self) -> Result<(), VmmError> {
-        for region in self.vm.guest_memory().iter() {
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+        for region in kvm_vm.guest_memory().iter() {
             let len = usize::try_from(region.len()).map_err(|_| {
                 VmmError::AgentRuntimeMadvise(io::Error::other(
                     "guest memory region length overflow",
@@ -1038,16 +1012,6 @@ mod tests {
     use crate::builder::tests::default_vmm;
 
     #[test]
-    fn test_host_has_swap_enabled_from_contents() {
-        assert!(!host_has_swap_enabled_from_contents(
-            "Filename\tType\tSize\tUsed\tPriority\n"
-        ));
-        assert!(host_has_swap_enabled_from_contents(
-            "Filename\tType\tSize\tUsed\tPriority\n/dev/zram0\tpartition\t102396\t0\t100\n"
-        ));
-    }
-
-    #[test]
     fn test_llm_response_payload_format() {
         let payload = llm_response_payload("req-1", "{\"ok\":true}").unwrap();
         assert_eq!(payload.last(), Some(&b'\n'));
@@ -1058,16 +1022,22 @@ mod tests {
     }
 
     #[test]
-    fn test_enter_llm_wait_without_swap_fails() {
+    fn test_enter_llm_wait_without_swap_check_attempts_reclaim() {
         let mut vmm = default_vmm();
         let config = EnterLlmWaitConfig {
             pause_on_wait: Some(true),
         };
 
-        let err = vmm.enter_llm_wait_with_swap(config, false).unwrap_err();
-        assert!(matches!(err, VmmError::AgentRuntimeSwapNotAvailable));
-        assert!(!vmm.in_llm_wait);
-        assert!(!vmm.paused_by_llm_wait);
+        match vmm.enter_llm_wait_inner(config) {
+            Ok(()) => {
+                assert!(vmm.in_llm_wait);
+                assert!(!vmm.paused_by_llm_wait);
+            }
+            Err(err) => assert!(matches!(
+                err,
+                VmmError::AgentRuntimeUnsupportedAdvice | VmmError::AgentRuntimeMadvise(_)
+            )),
+        }
     }
 
     #[test]
@@ -1079,7 +1049,7 @@ mod tests {
 
         vmm.in_llm_wait = true;
         vmm.paused_by_llm_wait = true;
-        vmm.enter_llm_wait_with_swap(config, true).unwrap();
+        vmm.enter_llm_wait_inner(config).unwrap();
         assert!(vmm.in_llm_wait);
         assert!(vmm.paused_by_llm_wait);
     }
@@ -1091,7 +1061,7 @@ mod tests {
             pause_on_wait: Some(false),
         };
 
-        match vmm.enter_llm_wait_with_swap(config, true) {
+        match vmm.enter_llm_wait_inner(config) {
             Ok(()) => {
                 assert!(vmm.in_llm_wait);
                 assert!(!vmm.paused_by_llm_wait);

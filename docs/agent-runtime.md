@@ -43,11 +43,10 @@ Request body:
 
 ### Enter `LlmWaiting`
 
-1. Verify host swap is enabled (`/proc/swaps` has at least one entry).
-2. If `pause_on_wait=true` and VM is running, pause vCPUs.
-3. Iterate all guest memory regions and call:
+1. If `pause_on_wait=true` and VM is running, pause vCPUs.
+2. Iterate all guest memory regions and call:
    - `madvise(MADV_PAGEOUT)` on each region.
-4. Mark VM as in LLM wait mode.
+3. Mark VM as in LLM wait mode.
 
 ### Exit to `Running`
 
@@ -68,5 +67,6 @@ Both transitions are idempotent.
 ## Operational notes
 
 - Reclaim is best-effort; it does not guarantee instant 100% RSS eviction.
-- Swap (or zram-backed swap) is required for `MADV_PAGEOUT`-based reclaim.
-- If swap is unavailable, entering `LlmWaiting` fails with a clear error.
+- `MADV_PAGEOUT` is best-effort and does not require Firecracker to reject
+  `LlmWaiting` on hosts without swap. On swapless hosts, the kernel may reclaim
+  clean pages and may keep dirty anonymous pages resident.
