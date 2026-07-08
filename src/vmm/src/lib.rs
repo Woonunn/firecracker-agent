@@ -150,7 +150,7 @@ use crate::mmds::data_store::Mmds;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
 use crate::resources::VmmConfig;
-use crate::rpc_interface::VmmActionError;
+use crate::rpc_interface::{GuestMemoryRegionInfo, GuestMemoryRegions, VmmActionError};
 use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
@@ -279,6 +279,8 @@ pub enum VmmError {
     AgentRuntimeUnsupportedAdvice,
     /// Agent runtime madvise call failed: {0}
     AgentRuntimeMadvise(io::Error),
+    /// Failed to resolve a guest memory region host address: {0}
+    GuestMemoryRegionAddress(io::Error),
     /// Agent runtime requires a configured vsock device.
     AgentRuntimeVsockNotConfigured,
     /// Failed to connect to agent runtime vsock endpoint {0}: {1}
@@ -614,6 +616,33 @@ impl Vmm {
             .ok_or(VmmError::AgentRuntimeVsockNotConfigured)?
             .uds_path;
         Ok(format!("{}_{}", vsock_path, port))
+    }
+
+    /// Returns the current guest memory region table with host virtual base addresses.
+    pub fn guest_memory_regions(&self) -> Result<GuestMemoryRegions, VmmError> {
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+
+        let mut regions = Vec::with_capacity(kvm_vm.guest_memory().num_regions());
+        for region in kvm_vm.guest_memory().iter() {
+            let host_addr = region
+                .get_host_address(MemoryRegionAddress(0))
+                .map_err(|err| {
+                    VmmError::GuestMemoryRegionAddress(io::Error::other(err.to_string()))
+                })?;
+            let host_addr = u64::try_from(host_addr as usize).map_err(|_| {
+                VmmError::GuestMemoryRegionAddress(io::Error::other("host address overflow"))
+            })?;
+            regions.push(GuestMemoryRegionInfo {
+                guest_base: region.start_addr().0,
+                host_addr,
+                size: region.len(),
+            });
+        }
+
+        Ok(GuestMemoryRegions { regions })
     }
 
     fn reclaim_guest_memory_with_madvise(&self) -> Result<(), VmmError> {

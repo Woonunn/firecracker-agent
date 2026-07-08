@@ -86,9 +86,15 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "", None) => parse_get_instance_info(),
             (Method::Get, "balloon", None) => parse_get_balloon(path_tokens),
             (Method::Get, "version", None) => parse_get_version(),
-            (Method::Get, "vm", None) if path_tokens.next() == Some("config") => {
-                Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
-            }
+            (Method::Get, "vm", None) => match (path_tokens.next(), path_tokens.next()) {
+                (Some("config"), None) => {
+                    Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
+                }
+                (Some("memory-regions"), None) => {
+                    Ok(ParsedRequest::new_sync(VmmAction::GetGuestMemoryRegions))
+                }
+                _ => Err(RequestError::InvalidPathMethod("vm".to_string(), Method::Get)),
+            },
             (Method::Get, "machine-config", None) => parse_get_machine_config(),
             (Method::Get, "mmds", None) => parse_get_mmds(),
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
@@ -130,14 +136,10 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Patch, "network-interfaces", Some(body)) => {
                 parse_patch_net(body, path_tokens.next())
             }
-<<<<<<< HEAD
             (Method::Patch, "pmem", Some(body)) => parse_patch_pmem(body, path_tokens.next()),
-            (Method::Patch, "agent", Some(body)) if path_tokens.next() == Some("runtime") => {
-=======
             (Method::Patch, "agent", Some(body))
                 if path_tokens.next() == Some("runtime") && path_tokens.next().is_none() =>
             {
->>>>>>> e65aec0c2 (feat: host proxy)
                 parse_patch_agent_runtime(body)
             }
             (Method::Patch, "vm", Some(body)) => parse_patch_vm_state(body),
@@ -228,6 +230,7 @@ impl ParsedRequest {
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+                VmmData::GuestMemoryRegions(regions) => Self::success_response_with_data(regions),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -380,7 +383,7 @@ pub mod tests {
     use vmm::devices::virtio::balloon::device::HintingStatus;
     use vmm::vmm_config::agent_runtime::{EnterLlmWaitConfig, SubmitLlmResponseConfig};
     use vmm::resources::VmmConfig;
-    use vmm::rpc_interface::VmmActionError;
+    use vmm::rpc_interface::{GuestMemoryRegionInfo, GuestMemoryRegions, VmmActionError};
     use vmm::vmm_config::balloon::{BalloonDeviceConfig, BalloonStats};
     use vmm::vmm_config::instance_info::InstanceInfo;
     use vmm::vmm_config::machine_config::MachineConfig;
@@ -634,6 +637,9 @@ pub mod tests {
                 VmmData::FullVmConfig(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
                 }
+                VmmData::GuestMemoryRegions(regions) => {
+                    http_response(&serde_json::to_string(regions).unwrap(), 200)
+                }
                 VmmData::MachineConfiguration(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
                 }
@@ -664,6 +670,13 @@ pub mod tests {
         }));
         verify_ok_response_with(VmmData::Empty);
         verify_ok_response_with(VmmData::FullVmConfig(VmmConfig::default()));
+        verify_ok_response_with(VmmData::GuestMemoryRegions(GuestMemoryRegions {
+            regions: vec![GuestMemoryRegionInfo {
+                guest_base: 0,
+                host_addr: 0x1000,
+                size: 0x2000,
+            }],
+        }));
         verify_ok_response_with(VmmData::MachineConfiguration(MachineConfig::default()));
         verify_ok_response_with(VmmData::MmdsValue(serde_json::from_str("{}").unwrap()));
         verify_ok_response_with(VmmData::InstanceInformation(InstanceInfo::default()));

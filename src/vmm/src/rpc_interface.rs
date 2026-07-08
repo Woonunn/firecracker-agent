@@ -4,6 +4,7 @@
 use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use serde::Serialize;
 use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
@@ -72,6 +73,8 @@ pub enum VmmAction {
     GetBalloonStats,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
+    /// Get the guest memory regions with their host virtual addresses.
+    GetGuestMemoryRegions,
     /// Get MMDS contents.
     GetMMDS,
     /// Get the machine configuration of the microVM.
@@ -227,6 +230,24 @@ pub enum VmmActionError {
     PciManager(#[from] PciManagerError),
 }
 
+/// A guest memory region with its backing host virtual address.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct GuestMemoryRegionInfo {
+    /// Guest physical base address for this memory region.
+    pub guest_base: u64,
+    /// Host virtual base address backing this memory region.
+    pub host_addr: u64,
+    /// Region size in bytes.
+    pub size: u64,
+}
+
+/// Guest memory region table exported by the VMM.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct GuestMemoryRegions {
+    /// Guest memory regions in Firecracker's guest-memory iterator order.
+    pub regions: Vec<GuestMemoryRegionInfo>,
+}
+
 /// The enum represents the response sent by the VMM in case of success. The response is either
 /// empty, when no data needs to be sent, or an internal VMM structure.
 #[allow(clippy::large_enum_variant)]
@@ -240,6 +261,8 @@ pub enum VmmData {
     Empty,
     /// The complete microVM configuration in JSON format.
     FullVmConfig(VmmConfig),
+    /// The guest memory regions with their host virtual addresses.
+    GuestMemoryRegions(GuestMemoryRegions),
     /// The microVM configuration represented by `VmConfig`.
     MachineConfiguration(MachineConfig),
     /// Mmds contents.
@@ -467,6 +490,7 @@ impl<'a> PrebootApiController<'a> {
                 );
                 Ok(VmmData::FullVmConfig((&*self.vm_resources).into()))
             }
+            GetGuestMemoryRegions => Err(VmmActionError::OperationNotSupportedPreBoot),
             GetMMDS => Ok(VmmData::MmdsValue(
                 self.vm_resources
                     .locked_mmds_or_default()
@@ -731,6 +755,13 @@ impl RuntimeApiController {
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),
             )),
+            GetGuestMemoryRegions => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .guest_memory_regions()
+                .map(VmmData::GuestMemoryRegions)
+                .map_err(VmmActionError::InternalVmm),
             GetMemoryHotplugStatus => self
                 .vmm
                 .lock()
